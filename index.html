@@ -1,0 +1,807 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, maximum-scale=1">
+<meta name="theme-color" content="#0A0A0A">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="Constância">
+<title>Constância</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Ctext y='.9em' font-size='90'%3E🔥%3C/text%3E%3C/svg%3E">
+<script src="https://cdn.tailwindcss.com"></script>
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
+<style>
+  html, body { background:#0A0A0A; color:#FAFAFA; -webkit-tap-highlight-color: transparent; }
+  body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Inter, sans-serif; overscroll-behavior-y: none; }
+  .card { background:#141414; border:1px solid #262626; border-radius:16px; }
+  .inp { width:100%; background:#0A0A0A; border:1px solid #262626; border-radius:12px; padding:10px 12px; color:#FAFAFA; outline:none; font-size:16px; }
+  .inp:focus { border-color:#10B981; }
+  .btn { background:#10B981; color:#04130D; font-weight:700; border-radius:12px; padding:10px 16px; transition:transform .1s, opacity .2s; }
+  .btn:active { transform:scale(.97); }
+  .btn:disabled { opacity:.45; }
+  .btn-ghost { background:#1a1a1a; color:#FAFAFA; border:1px solid #262626; border-radius:12px; padding:8px 14px; font-weight:600; }
+  .btn-ghost:active { transform:scale(.97); }
+  .pb { height:8px; background:#1f1f1f; border-radius:999px; overflow:hidden; }
+  .pb > div { height:100%; background:#10B981; border-radius:999px; transition:width .35s ease; }
+  .chk { width:26px; height:26px; border-radius:999px; border:2px solid #3a3a3a; display:flex; align-items:center; justify-content:center; flex:none; transition:all .15s; }
+  .chk.on { background:#10B981; border-color:#10B981; }
+  .item { transition: background .15s, transform .1s; }
+  .item:active { transform:scale(.99); }
+  .safe-b { padding-bottom: env(safe-area-inset-bottom); }
+  .safe-t { padding-top: env(safe-area-inset-top); }
+  .fade { animation: fade .25s ease; }
+  @keyframes fade { from { opacity:0; transform:translateY(6px);} to { opacity:1; transform:none; } }
+  input[type=date]::-webkit-calendar-picker-indicator { filter: invert(1); }
+</style>
+</head>
+<body class="min-h-screen">
+
+<!-- LOGIN -->
+<div id="login" class="hidden min-h-screen flex items-center justify-center px-6">
+  <form id="loginForm" class="w-full max-w-sm space-y-4 fade">
+    <div class="text-center mb-6">
+      <div class="text-5xl mb-2">🔥</div>
+      <h1 class="text-2xl font-bold">Constância</h1>
+      <p class="text-sm text-neutral-500">Evolução a dois, todos os dias.</p>
+    </div>
+    <input id="lEmail" type="email" autocomplete="email" placeholder="E-mail" required class="inp">
+    <input id="lPass" type="password" autocomplete="current-password" placeholder="Senha" required class="inp">
+    <button id="lBtn" class="btn w-full" type="submit">Entrar</button>
+    <p id="lErr" class="text-sm text-red-400 text-center min-h-[1.25rem]"></p>
+  </form>
+</div>
+
+<!-- APP -->
+<div id="app" class="hidden">
+  <nav id="nav" class="fixed bottom-0 inset-x-0 z-30 bg-[#0f0f0f] border-t border-[#262626] flex safe-b md:inset-x-auto md:left-0 md:top-0 md:w-48 md:h-full md:flex-col md:border-t-0 md:border-r md:p-3 md:gap-1"></nav>
+  <main class="md:ml-48 safe-t">
+    <div class="max-w-xl mx-auto px-4 pt-4 pb-28 md:pb-10">
+      <div id="banner"></div>
+      <div id="content" class="fade"></div>
+    </div>
+  </main>
+</div>
+
+<div id="modal"></div>
+<div id="toast" class="fixed left-1/2 -translate-x-1/2 top-4 z-[60] hidden px-4 py-2 rounded-xl text-sm font-medium shadow-lg"></div>
+
+<script>
+// ======================= CONFIGURAÇÃO SUPABASE =======================
+const SUPABASE_URL = 'https://czeasuvpfhoiirchevcu.supabase.co';
+const SUPABASE_ANON_KEY = 'sb_publishable_iwooYO-qdZ0QXV68bkGaOQ_Z-8AS1B7';
+// =====================================================================
+
+const sb = supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
+
+const S = {
+  uid: null, email: '', profiles: [], habits: [], done: new Set(),
+  date: null, tab: 'today', note: '', noteSaved: '',
+  goals: [], pv: 'me', px: null, nudges: [], modal: null,
+  cool: 0, started: false, poll: null
+};
+try { S.cool = Number(localStorage.getItem('nudge_cool') || 0); } catch (e) {}
+
+// ----------------------- utilidades -----------------------
+const $ = id => document.getElementById(id);
+const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const pad = n => String(n).padStart(2, '0');
+const ymd = d => `${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())}`;
+const parseD = s => { const [y,m,d] = s.split('-').map(Number); return new Date(y, m-1, d); };
+const addDays = (s, n) => { const d = parseD(s); d.setDate(d.getDate() + n); return ymd(d); };
+const today = () => ymd(new Date());
+const pctTxt = x => Math.round(x * 100) + '%';
+const round2 = x => Math.round(x * 100) / 100;
+const fmtDate = s => parseD(s).toLocaleDateString('pt-BR', { weekday: 'long', day: '2-digit', month: 'long' });
+const fmtShort = s => parseD(s).toLocaleDateString('pt-BR', { day: '2-digit', month: '2-digit' });
+
+let toastT;
+function toast(msg, err) {
+  const t = $('toast');
+  t.textContent = msg;
+  t.className = 'fixed left-1/2 -translate-x-1/2 top-4 z-[60] px-4 py-2 rounded-xl text-sm font-medium shadow-lg ' + (err ? 'bg-red-500 text-white' : 'bg-emerald-500 text-black');
+  clearTimeout(toastT);
+  toastT = setTimeout(() => t.classList.add('hidden'), 2600);
+}
+
+async function fetchAll(mk) {
+  let out = [], from = 0;
+  while (true) {
+    const { data, error } = await mk().range(from, from + 999);
+    if (error) throw error;
+    out = out.concat(data);
+    if (data.length < 1000) break;
+    from += 1000;
+  }
+  return out;
+}
+
+// ----------------------- dados derivados -----------------------
+const me = () => S.profiles.find(p => p.id === S.uid);
+const partner = () => S.profiles.find(p => p.id !== S.uid);
+const viewProfile = () => S.pv === 'me' ? me() : partner();
+const activeHabits = uid => S.habits.filter(h => h.user_id === uid && h.active);
+const habitById = id => S.habits.find(h => h.id === id);
+
+function dayPct(uid, date) {
+  const hs = activeHabits(uid);
+  if (!hs.length) return 0;
+  let c = 0;
+  for (const h of hs) if (S.done.has(h.id + '|' + date)) c++;
+  return c / hs.length;
+}
+function rangePct(uid, days) {
+  let s = 0;
+  for (let i = 0; i < days; i++) s += dayPct(uid, addDays(today(), -i));
+  return s / days;
+}
+function streak(uid) {
+  let d = today();
+  if (dayPct(uid, d) < 0.8) d = addDays(d, -1);
+  let n = 0;
+  while (n < 1500 && dayPct(uid, d) >= 0.8) { n++; d = addDays(d, -1); }
+  return n;
+}
+function workouts(uid, days) {
+  const hs = S.habits.filter(h => h.user_id === uid && h.category === 'workout');
+  const from = days ? addDays(today(), -(days - 1)) : '0000-00-00';
+  let c = 0;
+  for (const k of S.done) {
+    const [hid, dt] = k.split('|');
+    if (dt >= from && hs.some(h => h.id === hid)) c++;
+  }
+  return c;
+}
+function overallPct(uid) {
+  const ids = new Set(S.habits.filter(h => h.user_id === uid).map(h => h.id));
+  let first = null;
+  for (const k of S.done) {
+    const [hid, dt] = k.split('|');
+    if (ids.has(hid) && (!first || dt < first)) first = dt;
+  }
+  if (!first) return 0;
+  const days = Math.min(1500, Math.max(1, Math.round((parseD(today()) - parseD(first)) / 86400000) + 1));
+  return rangePct(uid, days);
+}
+const bmi = p => (p && p.weight && p.height) ? p.weight / Math.pow(p.height / 100, 2) : null;
+const bmiLabel = v => v < 18.5 ? 'Abaixo do peso' : v < 25 ? 'Peso normal' : v < 30 ? 'Sobrepeso' : 'Obesidade';
+
+function av(p, size) {
+  const s = size || 48;
+  if (p && p.avatar_url) return `<img src="${esc(p.avatar_url)}" alt="" style="width:${s}px;height:${s}px" class="rounded-full object-cover border border-[#262626] flex-none">`;
+  const ini = esc(((p && p.name) || '?').trim().charAt(0).toUpperCase());
+  return `<div style="width:${s}px;height:${s}px;font-size:${Math.round(s/2.3)}px" class="rounded-full bg-[#1f1f1f] border border-[#262626] flex items-center justify-center font-bold text-emerald-400 flex-none">${ini}</div>`;
+}
+
+// ----------------------- AUTH -----------------------
+$('loginForm').addEventListener('submit', async e => {
+  e.preventDefault();
+  $('lErr').textContent = '';
+  $('lBtn').disabled = true;
+  const { error } = await sb.auth.signInWithPassword({ email: $('lEmail').value.trim(), password: $('lPass').value });
+  $('lBtn').disabled = false;
+  if (error) $('lErr').textContent = 'E-mail ou senha inválidos.';
+});
+
+sb.auth.onAuthStateChange((ev, session) => {
+  if (session && session.user) {
+    if (S.uid !== session.user.id || !S.started) setTimeout(() => start(session.user), 0);
+  } else {
+    stopApp();
+  }
+});
+
+function stopApp() {
+  S.uid = null; S.started = false;
+  clearInterval(S.poll);
+  $('app').classList.add('hidden');
+  $('login').classList.remove('hidden');
+  $('modal').innerHTML = '';
+}
+
+async function start(user) {
+  if (S.started && S.uid === user.id) return;
+  S.started = true;
+  S.uid = user.id;
+  S.email = user.email || '';
+  S.date = today();
+  S.tab = 'today';
+  S.pv = 'me';
+  $('login').classList.add('hidden');
+  $('app').classList.remove('hidden');
+  try {
+    await loadAll();
+    await loadNote();
+    render();
+    clearInterval(S.poll);
+    S.poll = setInterval(loadNudges, 30000);
+  } catch (e) {
+    console.error(e);
+    toast('Erro ao carregar dados: ' + (e.message || e), true);
+  }
+}
+
+document.addEventListener('visibilitychange', () => { if (!document.hidden && S.uid) loadNudges(); });
+
+async function loadAll() {
+  const [pr, hb, lg, gl, nd] = await Promise.all([
+    sb.from('profiles').select('*'),
+    sb.from('habits').select('*').order('created_at'),
+    fetchAll(() => sb.from('habit_logs').select('habit_id,log_date').eq('completed', true).order('log_date').order('habit_id')),
+    sb.from('goals').select('*').or('user_id.is.null,user_id.eq.' + S.uid).order('title'),
+    sb.from('nudges').select('*').eq('receiver_id', S.uid).eq('seen', false).order('created_at', { ascending: false })
+  ]);
+  if (pr.error) throw pr.error;
+  if (hb.error) throw hb.error;
+  S.profiles = pr.data || [];
+  if (!me()) {
+    const nm = S.email.split('@')[0] || 'Eu';
+    const { data } = await sb.from('profiles').upsert({ id: S.uid, name: nm }).select().single();
+    if (data) S.profiles.push(data);
+  }
+  S.habits = hb.data || [];
+  S.done = new Set(lg.map(r => r.habit_id + '|' + r.log_date));
+  S.goals = gl.data || [];
+  S.nudges = nd.data || [];
+}
+
+async function loadNudges() {
+  if (!S.uid) return;
+  const { data } = await sb.from('nudges').select('*').eq('receiver_id', S.uid).eq('seen', false).order('created_at', { ascending: false });
+  if (data) { S.nudges = data; renderBanner(); }
+}
+
+async function loadNote() {
+  const d = S.date;
+  const { data } = await sb.from('daily_notes').select('content').eq('user_id', S.uid).eq('note_date', d).maybeSingle();
+  if (d !== S.date) return;
+  S.note = (data && data.content) || '';
+  S.noteSaved = S.note;
+}
+
+async function loadPx() {
+  const p = viewProfile();
+  if (!p) { S.px = null; if (S.tab === 'profile') render(); return; }
+  const id = p.id;
+  const [w, n] = await Promise.all([
+    sb.from('weight_logs').select('weight,logged_at').eq('user_id', id).order('logged_at').order('created_at'),
+    sb.from('daily_notes').select('content,note_date').eq('user_id', id).neq('content', '').order('note_date', { ascending: false }).limit(1)
+  ]);
+  const v = viewProfile();
+  if (!v || v.id !== id) return;
+  S.px = { uid: id, weights: w.data || [], note: (n.data || [])[0] || null };
+  if (S.tab === 'profile') render();
+}
+
+// ----------------------- NAVEGAÇÃO / RENDER -----------------------
+const TABS = [['today', 'Hoje', '✅'], ['rank', 'Ranking', '🏆'], ['goals', 'Metas', '🎯'], ['profile', 'Perfil', '👤']];
+
+function setTab(t) {
+  S.tab = t;
+  if (t === 'profile') { S.px = null; loadPx(); }
+  render();
+  window.scrollTo(0, 0);
+}
+
+function renderNav() {
+  $('nav').innerHTML =
+    `<div class="hidden md:block px-3 py-4 text-lg font-bold">🔥 Constância</div>` +
+    TABS.map(([k, l, i]) => `
+      <button onclick="setTab('${k}')" class="flex-1 md:flex-none flex flex-col md:flex-row items-center md:gap-3 gap-0.5 py-2.5 md:px-3 md:rounded-xl text-xs md:text-sm font-semibold transition ${S.tab === k ? 'text-emerald-400 md:bg-[#1a1a1a]' : 'text-neutral-500'}">
+        <span class="text-xl md:text-lg">${i}</span><span>${l}</span>
+      </button>`).join('');
+}
+
+function renderBanner() {
+  const b = $('banner');
+  if (!S.nudges.length) { b.innerHTML = ''; return; }
+  const last = S.nudges[0];
+  const sender = S.profiles.find(p => p.id === last.sender_id);
+  const extra = S.nudges.length > 1 ? ` (${S.nudges.length}x)` : '';
+  b.innerHTML = `
+    <div class="mb-4 flex items-center gap-3 rounded-2xl border border-emerald-500/30 bg-emerald-500/10 px-4 py-3 fade">
+      <div class="flex-1 text-sm">🔥 <b>${esc(sender ? sender.name : 'Seu parceiro')}</b> te mandou um incentivo hoje!${extra}</div>
+      <button onclick="dismissNudges()" class="text-xs font-semibold text-emerald-300 px-3 py-1.5 rounded-lg bg-emerald-500/15">Dispensar</button>
+    </div>`;
+}
+
+async function dismissNudges() {
+  const ids = S.nudges.map(n => n.id);
+  S.nudges = [];
+  renderBanner();
+  if (ids.length) {
+    const { error } = await sb.from('nudges').update({ seen: true }).in('id', ids);
+    if (error) { toast('Não foi possível dispensar.', true); loadNudges(); }
+  }
+}
+
+function render() {
+  renderNav();
+  renderBanner();
+  const views = { today: vToday, rank: vRank, goals: vGoals, profile: vProfile };
+  $('content').innerHTML = views[S.tab]();
+}
+
+// ----------------------- ABA HOJE -----------------------
+function vToday() {
+  const hs = activeHabits(S.uid);
+  const hab = hs.filter(h => h.category === 'habit');
+  const wk = hs.filter(h => h.category === 'workout');
+  const dn = hs.filter(h => S.done.has(h.id + '|' + S.date)).length;
+  const pct = hs.length ? Math.round(dn / hs.length * 100) : 0;
+  const isT = S.date === today();
+  const item = h => {
+    const on = S.done.has(h.id + '|' + S.date);
+    return `<button onclick="toggleHabit('${h.id}')" class="item w-full flex items-center gap-3 text-left card px-4 py-3.5 ${on ? 'border-emerald-500/40 bg-emerald-500/5' : ''}">
+      <span class="chk ${on ? 'on' : ''}">${on ? '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="#04130D" stroke-width="4" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12l5 5L20 7"/></svg>' : ''}</span>
+      <span class="flex-1 ${on ? 'text-neutral-400 line-through decoration-neutral-600' : ''}">${esc(h.title)}</span>
+    </button>`;
+  };
+  const section = (title, arr, emoji) => `
+    <section>
+      <h2 class="text-xs uppercase tracking-wider text-neutral-500 font-semibold mb-2">${emoji} ${title}</h2>
+      <div class="space-y-2">${arr.length ? arr.map(item).join('') : '<div class="card px-4 py-4 text-sm text-neutral-500">Nenhum item ativo. Use “Gerenciar” para adicionar.</div>'}</div>
+    </section>`;
+  return `
+  <div class="space-y-5">
+    <div class="flex items-center justify-between gap-2">
+      <button onclick="shiftDate(-1)" class="btn-ghost w-11 h-11 flex items-center justify-center text-lg">‹</button>
+      <div class="flex-1 text-center">
+        <div class="font-semibold capitalize">${isT ? 'Hoje' : esc(fmtDate(S.date))}</div>
+        <input type="date" value="${S.date}" max="${today()}" onchange="setDate(this.value)" class="bg-transparent text-xs text-neutral-500 text-center outline-none">
+      </div>
+      <button onclick="shiftDate(1)" ${isT ? 'disabled' : ''} class="btn-ghost w-11 h-11 flex items-center justify-center text-lg ${isT ? 'opacity-30' : ''}">›</button>
+    </div>
+
+    <div class="card p-4">
+      <div class="flex items-end justify-between mb-2">
+        <span class="text-sm text-neutral-400">Progresso do dia</span>
+        <span class="text-2xl font-bold text-emerald-400">${pct}%</span>
+      </div>
+      <div class="pb"><div style="width:${pct}%"></div></div>
+      <div class="text-xs text-neutral-500 mt-2">${dn} de ${hs.length} concluídos</div>
+    </div>
+
+    <div class="card p-4">
+      <label class="text-xs uppercase tracking-wider text-neutral-500 font-semibold">📝 Nota do dia</label>
+      <div class="flex gap-2 mt-2 items-start">
+        <textarea rows="2" maxlength="500" oninput="S.note=this.value" placeholder="Como foi o dia/treino?" class="inp flex-1 resize-none">${esc(S.note)}</textarea>
+        <button onclick="saveNote()" class="btn">Salvar</button>
+      </div>
+    </div>
+
+    ${section('Hábitos Diários', hab, '🌱')}
+    ${section('Treinos', wk, '💪')}
+
+    <button onclick="openModal('manage')" class="btn-ghost w-full">+ Gerenciar Hábitos/Treinos</button>
+  </div>`;
+}
+
+async function setDate(v) {
+  if (!v) return;
+  if (v > today()) v = today();
+  S.date = v;
+  S.note = ''; S.noteSaved = '';
+  render();
+  await loadNote();
+  if (S.tab === 'today') render();
+}
+function shiftDate(n) {
+  const d = addDays(S.date, n);
+  if (d > today()) return;
+  setDate(d);
+}
+
+async function toggleHabit(id) {
+  const key = id + '|' + S.date;
+  const date = S.date;
+  const was = S.done.has(key);
+  was ? S.done.delete(key) : S.done.add(key);
+  render();
+  const { error } = await sb.from('habit_logs').upsert(
+    { habit_id: id, user_id: S.uid, log_date: date, completed: !was },
+    { onConflict: 'habit_id,log_date' }
+  );
+  if (error) {
+    was ? S.done.add(key) : S.done.delete(key);
+    render();
+    toast('Erro ao salvar. Tente novamente.', true);
+  }
+}
+
+async function saveNote() {
+  const content = S.note.trim();
+  const { error } = await sb.from('daily_notes').upsert(
+    { user_id: S.uid, note_date: S.date, content },
+    { onConflict: 'user_id,note_date' }
+  );
+  if (error) return toast('Erro ao salvar a nota.', true);
+  S.noteSaved = content;
+  toast('Nota salva ✓');
+}
+
+// ----------------------- GERENCIAR HÁBITOS (modal) -----------------------
+function openModal(m) { S.modal = m; renderModal(); }
+function closeModal() { S.modal = null; renderModal(); }
+
+function renderModal() {
+  const m = $('modal');
+  if (!S.modal) { m.innerHTML = ''; document.body.style.overflow = ''; return; }
+  document.body.style.overflow = 'hidden';
+  let inner = '';
+  if (S.modal === 'manage') {
+    const mine = S.habits.filter(h => h.user_id === S.uid);
+    inner = `
+      <h3 class="text-lg font-bold mb-3">Gerenciar Hábitos/Treinos</h3>
+      <div class="flex gap-2 mb-4">
+        <input id="mTitle" class="inp flex-1" placeholder="Novo item" maxlength="60">
+        <select id="mCat" class="inp !w-auto"><option value="habit">Hábito</option><option value="workout">Treino</option></select>
+        <button onclick="addHabit()" class="btn">+</button>
+      </div>
+      <div class="space-y-2">
+        ${mine.length ? mine.map(h => `
+          <div class="flex items-center gap-2 ${h.active ? '' : 'opacity-50'}">
+            <input class="inp flex-1" value="${esc(h.title)}" maxlength="60" onchange="renameHabit('${h.id}', this.value)">
+            <span class="text-xs text-neutral-500 w-12 text-center">${h.category === 'workout' ? '💪' : '🌱'}</span>
+            <button onclick="toggleActive('${h.id}')" class="btn-ghost text-xs !px-3">${h.active ? 'Desativar' : 'Ativar'}</button>
+          </div>`).join('') : '<p class="text-sm text-neutral-500">Nenhum item.</p>'}
+      </div>`;
+  } else if (S.modal === 'goal') {
+    inner = `
+      <h3 class="text-lg font-bold mb-3">Nova meta</h3>
+      <div class="space-y-3">
+        <input id="gTitle" class="inp" placeholder="Título (ex: Ler livros)" maxlength="80">
+        <div class="grid grid-cols-3 gap-2">
+          <input id="gCur" class="inp" inputmode="decimal" placeholder="Atual" value="0">
+          <input id="gTarget" class="inp" inputmode="decimal" placeholder="Alvo">
+          <input id="gUnit" class="inp" placeholder="Unidade" maxlength="12">
+        </div>
+        <select id="gScope" class="inp"><option value="me">Minha meta</option><option value="couple">Meta do casal</option></select>
+        <button onclick="createGoal()" class="btn w-full">Criar meta</button>
+      </div>`;
+  }
+  m.innerHTML = `
+    <div class="fixed inset-0 z-50 bg-black/70 flex items-end md:items-center justify-center fade" onclick="if(event.target===this)closeModal()">
+      <div class="w-full md:max-w-md bg-[#141414] border border-[#262626] rounded-t-3xl md:rounded-3xl p-5 max-h-[88vh] overflow-y-auto safe-b">
+        <div class="flex justify-end -mb-6"><button onclick="closeModal()" class="text-neutral-500 text-2xl leading-none px-2">×</button></div>
+        ${inner}
+      </div>
+    </div>`;
+}
+
+async function addHabit() {
+  const title = $('mTitle').value.trim();
+  if (!title) return;
+  const { data, error } = await sb.from('habits').insert({ user_id: S.uid, title, category: $('mCat').value }).select().single();
+  if (error) return toast('Erro ao adicionar.', true);
+  S.habits.push(data);
+  render(); renderModal();
+}
+async function renameHabit(id, v) {
+  const title = v.trim();
+  const h = habitById(id);
+  if (!title || !h || h.title === title) return;
+  const old = h.title;
+  h.title = title;
+  render();
+  const { error } = await sb.from('habits').update({ title }).eq('id', id);
+  if (error) { h.title = old; render(); renderModal(); toast('Erro ao renomear.', true); }
+}
+async function toggleActive(id) {
+  const h = habitById(id);
+  if (!h) return;
+  h.active = !h.active;
+  render(); renderModal();
+  const { error } = await sb.from('habits').update({ active: h.active }).eq('id', id);
+  if (error) { h.active = !h.active; render(); renderModal(); toast('Erro ao atualizar.', true); }
+}
+
+// ----------------------- ABA RANKING -----------------------
+function vRank() {
+  const ps = [me(), partner()].filter(Boolean);
+  const stats = ps.map(p => ({ p, w: rangePct(p.id, 7), m: rangePct(p.id, 30), s: streak(p.id), t: workouts(p.id, 30) }));
+  let leader = null;
+  if (stats.length === 2 && stats[0].w !== stats[1].w) leader = stats[0].w > stats[1].w ? stats[0].p.id : stats[1].p.id;
+  const bar = v => `<div class="pb mt-1"><div style="width:${Math.round(v * 100)}%"></div></div>`;
+  const card = st => `
+    <div class="card p-4 text-center ${st.p.id === leader ? 'border-emerald-500/50' : ''}">
+      <div class="flex justify-center mb-2">${av(st.p, 64)}</div>
+      <div class="font-bold truncate">${esc(st.p.name || 'Sem nome')} ${st.p.id === leader ? '👑' : ''}</div>
+      <div class="text-xs text-neutral-500 mb-3">${st.p.id === S.uid ? 'Você' : 'Parceiro(a)'}</div>
+      <div class="text-left space-y-3">
+        <div><div class="flex justify-between text-xs text-neutral-400"><span>Semanal</span><b class="text-emerald-400 text-base">${pctTxt(st.w)}</b></div>${bar(st.w)}</div>
+        <div><div class="flex justify-between text-xs text-neutral-400"><span>Mensal</span><b class="text-emerald-400 text-base">${pctTxt(st.m)}</b></div>${bar(st.m)}</div>
+        <div class="flex justify-between text-sm pt-1"><span class="text-neutral-400">🔥 Streak</span><b>${st.s} ${st.s === 1 ? 'dia' : 'dias'}</b></div>
+        <div class="flex justify-between text-sm"><span class="text-neutral-400">💪 Treinos (30d)</span><b>${st.t}</b></div>
+      </div>
+    </div>`;
+  return `
+    <h1 class="text-xl font-bold mb-1">Ranking</h1>
+    <p class="text-xs text-neutral-500 mb-4">Percentual de hábitos/treinos ativos concluídos. Streak: dias seguidos com ≥ 80%.</p>
+    <div class="grid grid-cols-2 gap-3">${stats.map(card).join('')}</div>
+    ${stats.length < 2 ? '<p class="text-sm text-neutral-500 text-center mt-6">Aguardando o segundo perfil ser criado no Supabase.</p>' : ''}`;
+}
+
+// ----------------------- ABA METAS -----------------------
+function vGoals() {
+  const shared = S.goals.filter(g => g.user_id === null);
+  const mine = S.goals.filter(g => g.user_id === S.uid);
+  const card = g => {
+    const cur = Number(g.current_value), tg = Number(g.target_value);
+    const pct = tg > 0 ? Math.min(100, Math.round(cur / tg * 100)) : 0;
+    return `
+    <div class="card p-4 ${g.completed ? 'border-emerald-500/40' : ''}">
+      <div class="flex items-start justify-between gap-2">
+        <div class="font-semibold">${g.completed ? '✅ ' : ''}${esc(g.title)}</div>
+        <button onclick="deleteGoal('${g.id}')" class="text-neutral-600 text-lg leading-none px-1">🗑</button>
+      </div>
+      <div class="pb my-3"><div style="width:${pct}%"></div></div>
+      <div class="flex items-center justify-between">
+        <button onclick="setGoalValue('${g.id}')" class="text-left">
+          <span class="text-xl font-bold text-emerald-400">${cur}</span>
+          <span class="text-neutral-400"> / ${tg} ${esc(g.unit || '')}</span>
+          <span class="text-xs text-neutral-600 ml-1">${pct}%</span>
+        </button>
+        <div class="flex gap-2">
+          <button onclick="adjustGoal('${g.id}',-1)" class="btn-ghost w-10 h-10 text-lg">−</button>
+          <button onclick="adjustGoal('${g.id}',1)" class="btn w-10 h-10 !p-0 text-lg">+</button>
+        </div>
+      </div>
+    </div>`;
+  };
+  const sec = (title, arr) => `
+    <section class="mb-6">
+      <h2 class="text-xs uppercase tracking-wider text-neutral-500 font-semibold mb-2">${title}</h2>
+      <div class="space-y-3">${arr.length ? arr.map(card).join('') : '<div class="card px-4 py-4 text-sm text-neutral-500">Nenhuma meta ainda.</div>'}</div>
+    </section>`;
+  return `
+    <div class="flex items-center justify-between mb-4">
+      <h1 class="text-xl font-bold">Metas</h1>
+      <button onclick="openModal('goal')" class="btn">+ Nova</button>
+    </div>
+    ${sec('💑 Metas do Casal', shared)}
+    ${sec('🎯 Minhas Metas', mine)}
+    <p class="text-xs text-neutral-600">Dica: toque no valor para digitar um número exato.</p>`;
+}
+
+async function updateGoal(g, val) {
+  const old = { current_value: g.current_value, completed: g.completed };
+  val = Math.max(0, round2(val));
+  g.current_value = val;
+  g.completed = Number(g.target_value) > 0 && val >= Number(g.target_value);
+  render();
+  const { error } = await sb.from('goals').update({ current_value: g.current_value, completed: g.completed }).eq('id', g.id);
+  if (error) { Object.assign(g, old); render(); toast('Erro ao atualizar meta.', true); }
+}
+function adjustGoal(id, d) {
+  const g = S.goals.find(x => x.id === id);
+  if (g) updateGoal(g, Number(g.current_value) + d);
+}
+function setGoalValue(id) {
+  const g = S.goals.find(x => x.id === id);
+  if (!g) return;
+  const v = prompt('Valor atual de "' + g.title + '":', g.current_value);
+  if (v === null) return;
+  const n = parseFloat(String(v).replace(',', '.'));
+  if (!isNaN(n)) updateGoal(g, n);
+}
+async function createGoal() {
+  const title = $('gTitle').value.trim();
+  const target = parseFloat($('gTarget').value.replace(',', '.'));
+  const cur = parseFloat($('gCur').value.replace(',', '.')) || 0;
+  if (!title || isNaN(target) || target <= 0) return toast('Informe título e valor alvo.', true);
+  const row = {
+    user_id: $('gScope').value === 'me' ? S.uid : null,
+    title, target_value: target, current_value: cur,
+    unit: $('gUnit').value.trim(), completed: cur >= target
+  };
+  const { data, error } = await sb.from('goals').insert(row).select().single();
+  if (error) return toast('Erro ao criar meta.', true);
+  S.goals.push(data);
+  closeModal(); render();
+  toast('Meta criada ✓');
+}
+async function deleteGoal(id) {
+  if (!confirm('Excluir esta meta?')) return;
+  const idx = S.goals.findIndex(g => g.id === id);
+  if (idx < 0) return;
+  const [g] = S.goals.splice(idx, 1);
+  render();
+  const { error } = await sb.from('goals').delete().eq('id', id);
+  if (error) { S.goals.splice(idx, 0, g); render(); toast('Erro ao excluir.', true); }
+}
+
+// ----------------------- ABA PERFIL -----------------------
+function vProfile() {
+  const p = viewProfile();
+  const isMe = S.pv === 'me';
+  const toggle = `
+    <div class="flex p-1 bg-[#141414] border border-[#262626] rounded-2xl mb-5">
+      <button onclick="setPv('me')" class="flex-1 py-2 rounded-xl text-sm font-semibold ${isMe ? 'bg-emerald-500 text-black' : 'text-neutral-400'}">Meu Perfil</button>
+      <button onclick="setPv('partner')" class="flex-1 py-2 rounded-xl text-sm font-semibold ${!isMe ? 'bg-emerald-500 text-black' : 'text-neutral-400'}">Perfil do Parceiro</button>
+    </div>`;
+  if (!p) return toggle + '<p class="text-sm text-neutral-500 text-center mt-8">O perfil do parceiro ainda não existe.</p>';
+
+  const b = bmi(p);
+  const px = (S.px && S.px.uid === p.id) ? S.px : null;
+  const cooling = S.cool > Date.now();
+
+  const head = `
+    <div class="card p-5 text-center mb-4">
+      <div class="flex justify-center mb-3 relative">
+        ${isMe ? `<label class="cursor-pointer relative">${av(p, 96)}<span class="absolute bottom-0 right-0 bg-emerald-500 text-black rounded-full w-8 h-8 flex items-center justify-center text-sm">📷</span><input type="file" accept="image/*" class="hidden" onchange="uploadAvatar(this)"></label>` : av(p, 96)}
+      </div>
+      <div class="text-xl font-bold">${esc(p.name || 'Sem nome')}</div>
+      ${!isMe ? `<button id="nudgeBtn" onclick="sendNudge()" ${cooling ? 'disabled' : ''} class="btn w-full mt-4 !py-3 text-base">${cooling ? nudgeLabel() : 'Mandar Incentivo 🔥'}</button>` : ''}
+    </div>`;
+
+  const info = `
+    <div class="grid grid-cols-2 gap-3 mb-4">
+      <div class="card p-4"><div class="text-xs text-neutral-500">Peso</div><div class="text-xl font-bold">${p.weight ? p.weight + ' kg' : '—'}</div></div>
+      <div class="card p-4"><div class="text-xs text-neutral-500">Altura</div><div class="text-xl font-bold">${p.height ? p.height + ' cm' : '—'}</div></div>
+      <div class="card p-4"><div class="text-xs text-neutral-500">IMC</div><div class="text-xl font-bold">${b ? b.toFixed(1) : '—'}</div><div class="text-xs text-neutral-500">${b ? bmiLabel(b) : ''}</div></div>
+      <div class="card p-4"><div class="text-xs text-neutral-500">Constância geral</div><div class="text-xl font-bold text-emerald-400">${pctTxt(overallPct(p.id))}</div><div class="text-xs text-neutral-500">💪 ${workouts(p.id, 0)} treinos</div></div>
+    </div>`;
+
+  // heatmap 30 dias
+  let cells = '';
+  for (let i = 29; i >= 0; i--) {
+    const d = addDays(today(), -i);
+    const v = dayPct(p.id, d);
+    const bg = v <= 0 ? '#1f1f1f' : `rgba(16,185,129,${(0.2 + 0.8 * v).toFixed(2)})`;
+    cells += `<div title="${fmtShort(d)} — ${pctTxt(v)}" style="background:${bg}" class="aspect-square rounded-md ${i === 0 ? 'ring-1 ring-white/40' : ''}"></div>`;
+  }
+  const heat = `
+    <div class="card p-4 mb-4">
+      <div class="flex justify-between items-center mb-3"><h3 class="font-semibold text-sm">Heatmap · 30 dias</h3>
+        <div class="flex items-center gap-1 text-[10px] text-neutral-500">menos
+          ${[0, .25, .5, .75, 1].map(v => `<span style="background:${v === 0 ? '#1f1f1f' : `rgba(16,185,129,${0.2 + 0.8 * v})`}" class="w-3 h-3 rounded-sm inline-block"></span>`).join('')} mais</div></div>
+      <div class="grid grid-cols-10 gap-1.5">${cells}</div>
+    </div>`;
+
+  const note = `
+    <div class="card p-4 mb-4">
+      <h3 class="font-semibold text-sm mb-2">📝 Nota recente${isMe ? '' : ' do parceiro'}</h3>
+      ${px && px.note ? `<div class="text-xs text-neutral-500 mb-1">${esc(fmtShort(px.note.note_date))}</div><p class="text-sm whitespace-pre-wrap">${esc(px.note.content)}</p>` : '<p class="text-sm text-neutral-500">Nenhuma nota registrada.</p>'}
+    </div>`;
+
+  const weight = `
+    <div class="card p-4 mb-4">
+      <h3 class="font-semibold text-sm mb-3">⚖️ Evolução corporal</h3>
+      ${weightChart(px ? px.weights : null)}
+    </div>`;
+
+  const edit = isMe ? `
+    <div class="card p-4 mb-4 space-y-3">
+      <h3 class="font-semibold text-sm">Editar perfil</h3>
+      <input id="pName" class="inp" placeholder="Nome" value="${esc(p.name || '')}" maxlength="40">
+      <div class="grid grid-cols-2 gap-2">
+        <input id="pWeight" class="inp" inputmode="decimal" placeholder="Peso (kg)" value="${p.weight ?? ''}">
+        <input id="pHeight" class="inp" inputmode="decimal" placeholder="Altura (cm)" value="${p.height ?? ''}">
+      </div>
+      <button onclick="saveProfile()" class="btn w-full">Salvar</button>
+    </div>
+    <button onclick="logout()" class="btn-ghost w-full !text-red-400">Sair</button>` : '';
+
+  return toggle + head + info + heat + note + weight + edit;
+}
+
+function weightChart(ws) {
+  if (!ws) return '<p class="text-sm text-neutral-500">Carregando…</p>';
+  if (!ws.length) return '<p class="text-sm text-neutral-500">Sem registros de peso ainda.</p>';
+  const list = ws.slice(-5).reverse().map(w => `<div class="flex justify-between text-sm py-1.5 border-t border-[#1f1f1f]"><span class="text-neutral-400">${fmtShort(w.logged_at)}</span><b>${Number(w.weight)} kg</b></div>`).join('');
+  if (ws.length < 2) return `<p class="text-sm text-neutral-500 mb-2">Registre outro peso para ver o gráfico.</p>${list}`;
+  const W = 320, H = 140, pl = 30, pr = 12, pt = 12, pb = 22;
+  const vals = ws.map(w => Number(w.weight));
+  let mn = Math.min(...vals), mx = Math.max(...vals);
+  if (mn === mx) { mn -= 1; mx += 1; }
+  const x = i => pl + (W - pl - pr) * (i / (ws.length - 1));
+  const y = v => pt + (H - pt - pb) * (1 - (v - mn) / (mx - mn));
+  const pts = ws.map((w, i) => `${x(i).toFixed(1)},${y(Number(w.weight)).toFixed(1)}`).join(' ');
+  const area = `${x(0).toFixed(1)},${H - pb} ${pts} ${x(ws.length - 1).toFixed(1)},${H - pb}`;
+  const dots = ws.map((w, i) => `<circle cx="${x(i).toFixed(1)}" cy="${y(Number(w.weight)).toFixed(1)}" r="3" fill="#10B981"><title>${fmtShort(w.logged_at)}: ${Number(w.weight)} kg</title></circle>`).join('');
+  return `
+    <svg viewBox="0 0 ${W} ${H}" class="w-full mb-2">
+      <polygon points="${area}" fill="rgba(16,185,129,.12)"/>
+      <polyline points="${pts}" fill="none" stroke="#10B981" stroke-width="2" stroke-linejoin="round" stroke-linecap="round"/>
+      ${dots}
+      <text x="${pl - 4}" y="${y(mx) + 3}" text-anchor="end" font-size="9" fill="#737373">${round2(mx)}</text>
+      <text x="${pl - 4}" y="${y(mn) + 3}" text-anchor="end" font-size="9" fill="#737373">${round2(mn)}</text>
+      <text x="${pl}" y="${H - 6}" font-size="9" fill="#737373">${fmtShort(ws[0].logged_at)}</text>
+      <text x="${W - pr}" y="${H - 6}" text-anchor="end" font-size="9" fill="#737373">${fmtShort(ws[ws.length - 1].logged_at)}</text>
+    </svg>${list}`;
+}
+
+function setPv(v) {
+  S.pv = v; S.px = null;
+  render();
+  loadPx();
+}
+
+async function saveProfile() {
+  const p = me();
+  const name = $('pName').value.trim() || p.name;
+  const w = parseFloat($('pWeight').value.replace(',', '.'));
+  const h = parseFloat($('pHeight').value.replace(',', '.'));
+  const upd = { name, weight: isNaN(w) ? null : w, height: isNaN(h) ? null : h, updated_at: new Date().toISOString() };
+  const old = p.weight;
+  const { error } = await sb.from('profiles').update(upd).eq('id', S.uid);
+  if (error) return toast('Erro ao salvar perfil.', true);
+  Object.assign(p, upd);
+  const hasLogs = S.px && S.px.uid === S.uid && S.px.weights.length > 0;
+  if (!isNaN(w) && (Number(old) !== w || !hasLogs)) {
+    const { error: e2 } = await sb.from('weight_logs').insert({ user_id: S.uid, weight: w, logged_at: today() });
+    if (e2) toast('Perfil salvo, mas o histórico de peso falhou.', true);
+  }
+  await loadPx();
+  render();
+  toast('Perfil salvo ✓');
+}
+
+async function resizeImg(file, size) {
+  const bmp = await createImageBitmap(file);
+  const s = Math.min(bmp.width, bmp.height);
+  const c = document.createElement('canvas');
+  c.width = c.height = size;
+  c.getContext('2d').drawImage(bmp, (bmp.width - s) / 2, (bmp.height - s) / 2, s, s, 0, 0, size, size);
+  return new Promise((res, rej) => c.toBlob(b => b ? res(b) : rej(new Error('Falha ao processar imagem')), 'image/jpeg', 0.85));
+}
+
+async function uploadAvatar(input) {
+  const f = input.files && input.files[0];
+  if (!f) return;
+  try {
+    toast('Enviando foto…');
+    const blob = await resizeImg(f, 512);
+    const path = `${S.uid}/avatar-${Date.now()}.jpg`;
+    const { error } = await sb.storage.from('avatars').upload(path, blob, { contentType: 'image/jpeg', upsert: true });
+    if (error) throw error;
+    const url = sb.storage.from('avatars').getPublicUrl(path).data.publicUrl;
+    const { error: e2 } = await sb.from('profiles').update({ avatar_url: url, updated_at: new Date().toISOString() }).eq('id', S.uid);
+    if (e2) throw e2;
+    me().avatar_url = url;
+    render();
+    toast('Foto atualizada ✓');
+  } catch (e) {
+    console.error(e);
+    toast('Erro ao enviar foto.', true);
+  }
+}
+
+// ----------------------- INCENTIVO -----------------------
+function nudgeLabel() {
+  const s = Math.max(0, Math.ceil((S.cool - Date.now()) / 1000));
+  return `Incentivo enviado ✓ (${s}s)`;
+}
+async function sendNudge() {
+  const p = partner();
+  if (!p || S.cool > Date.now()) return;
+  S.cool = Date.now() + 60000;
+  try { localStorage.setItem('nudge_cool', String(S.cool)); } catch (e) {}
+  const { error } = await sb.from('nudges').insert({ sender_id: S.uid, receiver_id: p.id });
+  if (error) {
+    S.cool = 0;
+    try { localStorage.removeItem('nudge_cool'); } catch (e) {}
+    return toast('Erro ao enviar incentivo.', true);
+  }
+  toast('Incentivo enviado 🔥');
+  render();
+}
+setInterval(() => {
+  const btn = $('nudgeBtn');
+  if (!btn) return;
+  if (S.cool > Date.now()) { btn.disabled = true; btn.textContent = nudgeLabel(); }
+  else if (btn.disabled) { btn.disabled = false; btn.textContent = 'Mandar Incentivo 🔥'; }
+}, 1000);
+
+async function logout() {
+  await sb.auth.signOut();
+}
+
+// ----------------------- INÍCIO -----------------------
+$('login').classList.remove('hidden');
+if (SUPABASE_URL.includes('SEU-PROJETO')) $('lErr').textContent = 'Configure SUPABASE_URL e SUPABASE_ANON_KEY no topo do script.';
+</script>
+</body>
+</html>
