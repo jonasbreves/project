@@ -608,8 +608,12 @@ function openGoal(id) { S.eg = id || null; openModal('goal'); }
 function renderModal() {
   const m = $('modal');
   if (!S.modal) { m.innerHTML = ''; document.body.style.overflow = ''; return; }
+  const prevBody = $('modalBody');                 // novo
+  const keepScroll = prevBody ? prevBody.scrollTop : 0;   // novo
+  const wasOpen = !!prevBody;                      // novo
   document.body.style.overflow = 'hidden';
   let inner = '';
+  // ... (resto igual)
   if (S.modal === 'manage') {
     const mine = S.habits.filter(h => h.user_id === S.uid);
     inner = `
@@ -656,12 +660,13 @@ function renderModal() {
       </div>`;
   }
   m.innerHTML = `
-    <div class="fixed inset-0 z-50 bg-black/70 flex items-end md:items-center justify-center fade" onclick="if(event.target===this)closeModal()">
-      <div class="w-full md:max-w-md bg-[#141414] border border-[#262626] rounded-t-3xl md:rounded-3xl p-5 max-h-[88vh] overflow-y-auto safe-b">
+    <div class="fixed inset-0 z-50 bg-black/70 flex items-end md:items-center justify-center ${wasOpen ? '' : 'fade'}" onclick="if(event.target===this)closeModal()">
+      <div id="modalBody" class="w-full md:max-w-md bg-[#141414] border border-[#262626] rounded-t-3xl md:rounded-3xl p-5 max-h-[88vh] overflow-y-auto safe-b">
         <div class="flex justify-end -mb-6"><button onclick="closeModal()" class="text-neutral-500 text-2xl leading-none px-2">×</button></div>
         ${inner}
       </div>
     </div>`;
+  if (wasOpen) { const b = $('modalBody'); if (b) b.scrollTop = keepScroll; }   // novo
 }
 
 async function addHabit() {
