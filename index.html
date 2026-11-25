@@ -79,7 +79,8 @@ const S = {
   uid: null, email: '', profiles: [], habits: [], done: new Set(),
   date: null, tab: 'today', note: '', noteSaved: '',
   goals: [], pv: 'me', px: null, nudges: [], modal: null,
-  cool: 0, started: false, poll: null
+  cool: 0, started: false, poll: null,
+  filter: 'all', tasks: null, tdate: null, eg: null
 };
 try { S.cool = Number(localStorage.getItem('nudge_cool') || 0); } catch (e) {}
 
@@ -123,10 +124,15 @@ const partner = () => S.profiles.find(p => p.id !== S.uid);
 const viewProfile = () => S.pv === 'me' ? me() : partner();
 const activeHabits = uid => S.habits.filter(h => h.user_id === uid && h.active);
 const habitById = id => S.habits.find(h => h.id === id);
+const ALL_DAYS = [0,1,2,3,4,5,6];
+const DL = ['D','S','T','Q','Q','S','S'];
+const dow = s => parseD(s).getDay();
+const scheduled = (uid, date) => activeHabits(uid).filter(h => (h.days_of_week || ALL_DAYS).includes(dow(date)));
 
 function dayPct(uid, date) {
-  const hs = activeHabits(uid);
-  if (!hs.length) return 0;
+  if (!activeHabits(uid).length) return 0;
+  const hs = scheduled(uid, date);
+  if (!hs.length) return 1; // dia sem itens programados = dia de descanso (não quebra streak)
   let c = 0;
   for (const h of hs) if (S.done.has(h.id + '|' + date)) c++;
   return c / hs.length;
@@ -266,20 +272,21 @@ async function loadPx() {
   const id = p.id;
   const [w, n] = await Promise.all([
     sb.from('weight_logs').select('weight,logged_at').eq('user_id', id).order('logged_at').order('created_at'),
-    sb.from('daily_notes').select('content,note_date').eq('user_id', id).neq('content', '').order('note_date', { ascending: false }).limit(1)
+    sb.from('daily_notes').select('content,note_date').eq('user_id', id).neq('content', '').order('note_date', { ascending: false }).limit(7)
   ]);
   const v = viewProfile();
   if (!v || v.id !== id) return;
-  S.px = { uid: id, weights: w.data || [], note: (n.data || [])[0] || null };
+  S.px = { uid: id, weights: w.data || [], notes: n.data || [] };
   if (S.tab === 'profile') render();
 }
 
 // ----------------------- NAVEGAÇÃO / RENDER -----------------------
-const TABS = [['today', 'Hoje', '✅'], ['rank', 'Ranking', '🏆'], ['goals', 'Metas', '🎯'], ['profile', 'Perfil', '👤']];
+const TABS = [['today', 'Hoje', '✅'], ['tasks', 'Tarefas', '📋'], ['rank', 'Ranking', '🏆'], ['goals', 'Metas', '🎯'], ['profile', 'Perfil', '👤']];
 
 function setTab(t) {
   S.tab = t;
   if (t === 'profile') { S.px = null; loadPx(); }
+  if (t === 'tasks') { S.tdate = S.date; S.tasks = null; loadTasks(); }
   render();
   window.scrollTo(0, 0);
 }
@@ -319,13 +326,13 @@ async function dismissNudges() {
 function render() {
   renderNav();
   renderBanner();
-  const views = { today: vToday, rank: vRank, goals: vGoals, profile: vProfile };
+  const views = { today: vToday, tasks: vTasks, rank: vRank, goals: vGoals, profile: vProfile };
   $('content').innerHTML = views[S.tab]();
 }
 
 // ----------------------- ABA HOJE -----------------------
 function vToday() {
-  const hs = activeHabits(S.uid);
+  const hs = scheduled(S.uid, S.date);
   const hab = hs.filter(h => h.category === 'habit');
   const wk = hs.filter(h => h.category === 'workout');
   const dn = hs.filter(h => S.done.has(h.id + '|' + S.date)).length;
@@ -341,8 +348,10 @@ function vToday() {
   const section = (title, arr, emoji) => `
     <section>
       <h2 class="text-xs uppercase tracking-wider text-neutral-500 font-semibold mb-2">${emoji} ${title}</h2>
-      <div class="space-y-2">${arr.length ? arr.map(item).join('') : '<div class="card px-4 py-4 text-sm text-neutral-500">Nenhum item ativo. Use “Gerenciar” para adicionar.</div>'}</div>
+      <div class="space-y-2">${arr.length ? arr.map(item).join('') : '<div class="card px-4 py-4 text-sm text-neutral-500">Nada programado para este dia. Use “Gerenciar” para ajustar.</div>'}</div>
     </section>`;
+  const pills = [['all', 'Tudo'], ['habit', 'Hábitos'], ['workout', 'Treinos']].map(([k, l]) =>
+    `<button onclick="setFilter('${k}')" class="px-3.5 py-1.5 rounded-full text-xs font-semibold border transition ${S.filter === k ? 'bg-emerald-500 text-black border-emerald-500' : 'bg-[#141414] text-neutral-400 border-[#262626]'}">${l}</button>`).join('');
   return `
   <div class="space-y-5">
     <div class="flex items-center justify-between gap-2">
@@ -371,12 +380,16 @@ function vToday() {
       </div>
     </div>
 
-    ${section('Hábitos Diários', hab, '🌱')}
-    ${section('Treinos', wk, '💪')}
+    <div class="flex gap-2">${pills}</div>
+
+    ${S.filter !== 'workout' ? section('Hábitos Diários', hab, '🌱') : ''}
+    ${S.filter !== 'habit' ? section('Treinos', wk, '💪') : ''}
 
     <button onclick="openModal('manage')" class="btn-ghost w-full">+ Gerenciar Hábitos/Treinos</button>
   </div>`;
 }
+
+function setFilter(f) { S.filter = f; render(); }
 
 async function setDate(v) {
   if (!v) return;
@@ -397,6 +410,7 @@ async function toggleHabit(id) {
   const key = id + '|' + S.date;
   const date = S.date;
   const was = S.done.has(key);
+  const before = dayPct(S.uid, date);
   was ? S.done.delete(key) : S.done.add(key);
   render();
   const { error } = await sb.from('habit_logs').upsert(
@@ -406,8 +420,39 @@ async function toggleHabit(id) {
   if (error) {
     was ? S.done.add(key) : S.done.delete(key);
     render();
-    toast('Erro ao salvar. Tente novamente.', true);
+    return toast('Erro ao salvar. Tente novamente.', true);
   }
+  if (!was && before < 1 && dayPct(S.uid, date) >= 1) {
+    confetti();
+    toast('Dia 100% concluído! 🎉🔥');
+  }
+}
+
+function confetti() {
+  const c = document.createElement('canvas');
+  c.style.cssText = 'position:fixed;inset:0;width:100%;height:100%;pointer-events:none;z-index:70';
+  c.width = innerWidth; c.height = innerHeight;
+  document.body.appendChild(c);
+  const x = c.getContext('2d');
+  const cols = ['#10B981', '#34D399', '#FBBF24', '#F472B6', '#60A5FA', '#FAFAFA'];
+  const ps = Array.from({ length: 90 }, () => ({
+    x: c.width / 2, y: c.height * 0.35,
+    vx: (Math.random() - .5) * 12, vy: -Math.random() * 12 - 3,
+    s: 4 + Math.random() * 5, r: Math.random() * 6, vr: (Math.random() - .5) * .4,
+    c: cols[Math.random() * cols.length | 0]
+  }));
+  let f = 0;
+  (function t() {
+    x.clearRect(0, 0, c.width, c.height);
+    for (const p of ps) {
+      p.vy += .35; p.vx *= .99; p.x += p.vx; p.y += p.vy; p.r += p.vr;
+      x.save(); x.translate(p.x, p.y); x.rotate(p.r);
+      x.globalAlpha = Math.max(0, 1 - f / 110);
+      x.fillStyle = p.c; x.fillRect(-p.s / 2, -p.s / 2, p.s, p.s * .6);
+      x.restore();
+    }
+    if (++f < 110) requestAnimationFrame(t); else c.remove();
+  })();
 }
 
 async function saveNote() {
@@ -421,9 +466,95 @@ async function saveNote() {
   toast('Nota salva ✓');
 }
 
+async function loadTasks() {
+  const d = S.tdate;
+  const { data, error } = await sb.from('daily_tasks').select('*').eq('user_id', S.uid).eq('task_date', d).order('created_at');
+  if (d !== S.tdate) return;
+  if (error) { toast('Erro ao carregar tarefas.', true); S.tasks = []; } else S.tasks = data || [];
+  if (S.tab === 'tasks') render();
+}
+
+function vTasks() {
+  const isT = S.tdate === today();
+  const ts = S.tasks;
+  const dn = ts ? ts.filter(t => t.completed).length : 0;
+  const row = t => `
+    <div class="card flex items-center gap-3 px-4 py-3 ${t.completed ? 'border-emerald-500/40 bg-emerald-500/5' : ''}">
+      <button onclick="toggleTask('${t.id}')" class="chk ${t.completed ? 'on' : ''}">${t.completed ? '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="#04130D" stroke-width="4" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12l5 5L20 7"/></svg>' : ''}</button>
+      <span class="flex-1 break-words ${t.completed ? 'text-neutral-400 line-through decoration-neutral-600' : ''}">${esc(t.title)}</span>
+      <button onclick="deleteTask('${t.id}')" class="text-neutral-600 text-lg leading-none px-1">🗑</button>
+    </div>`;
+  return `
+  <div class="space-y-5">
+    <div class="flex items-center justify-between gap-2">
+      <button onclick="shiftTDate(-1)" class="btn-ghost w-11 h-11 flex items-center justify-center text-lg">‹</button>
+      <div class="flex-1 text-center">
+        <div class="font-semibold capitalize">${isT ? 'Hoje' : esc(fmtDate(S.tdate))}</div>
+        <input type="date" value="${S.tdate}" onchange="setTDate(this.value)" class="bg-transparent text-xs text-neutral-500 text-center outline-none">
+      </div>
+      <button onclick="shiftTDate(1)" class="btn-ghost w-11 h-11 flex items-center justify-center text-lg">›</button>
+    </div>
+
+    <form onsubmit="addTask(event)" class="flex gap-2">
+      <input id="tTitle" class="inp flex-1" placeholder="Nova tarefa do dia…" maxlength="120" autocomplete="off">
+      <button class="btn" type="submit">+</button>
+    </form>
+
+    <section>
+      <h2 class="text-xs uppercase tracking-wider text-neutral-500 font-semibold mb-2">📋 Tarefas ${ts && ts.length ? `· ${dn}/${ts.length}` : ''}</h2>
+      <div class="space-y-2">
+        ${ts === null ? '<div class="card px-4 py-4 text-sm text-neutral-500">Carregando…</div>'
+          : ts.length ? ts.map(row).join('')
+          : '<div class="card px-4 py-4 text-sm text-neutral-500">Nenhuma tarefa para este dia.</div>'}
+      </div>
+    </section>
+  </div>`;
+}
+
+function setTDate(v) {
+  if (!v) return;
+  S.tdate = v; S.tasks = null;
+  render(); loadTasks();
+}
+function shiftTDate(n) { setTDate(addDays(S.tdate, n)); }
+
+async function addTask(e) {
+  e.preventDefault();
+  const inp = $('tTitle');
+  const title = inp.value.trim();
+  if (!title) return;
+  const date = S.tdate;
+  inp.value = '';
+  const { data, error } = await sb.from('daily_tasks').insert({ user_id: S.uid, task_date: date, title }).select().single();
+  if (error) { inp.value = title; return toast('Erro ao adicionar tarefa.', true); }
+  if (date === S.tdate && S.tasks) S.tasks.push(data);
+  if (S.tab === 'tasks') { render(); const i = $('tTitle'); if (i) i.focus(); }
+}
+
+async function toggleTask(id) {
+  const t = S.tasks && S.tasks.find(x => x.id === id);
+  if (!t) return;
+  t.completed = !t.completed;
+  render();
+  const { error } = await sb.from('daily_tasks').update({ completed: t.completed }).eq('id', id);
+  if (error) { t.completed = !t.completed; render(); toast('Erro ao atualizar tarefa.', true); }
+}
+
+async function deleteTask(id) {
+  if (!S.tasks) return;
+  const idx = S.tasks.findIndex(x => x.id === id);
+  if (idx < 0) return;
+  const [t] = S.tasks.splice(idx, 1);
+  render();
+  const { error } = await sb.from('daily_tasks').delete().eq('id', id);
+  if (error) { S.tasks.splice(idx, 0, t); render(); toast('Erro ao excluir tarefa.', true); }
+}
+
+
 // ----------------------- GERENCIAR HÁBITOS (modal) -----------------------
 function openModal(m) { S.modal = m; renderModal(); }
-function closeModal() { S.modal = null; renderModal(); }
+function closeModal() { S.modal = null; S.eg = null; renderModal(); }
+function openGoal(id) { S.eg = id || null; openModal('goal'); }
 
 function renderModal() {
   const m = $('modal');
@@ -439,26 +570,39 @@ function renderModal() {
         <select id="mCat" class="inp !w-auto"><option value="habit">Hábito</option><option value="workout">Treino</option></select>
         <button onclick="addHabit()" class="btn">+</button>
       </div>
-      <div class="space-y-2">
-        ${mine.length ? mine.map(h => `
-          <div class="flex items-center gap-2 ${h.active ? '' : 'opacity-50'}">
-            <input class="inp flex-1" value="${esc(h.title)}" maxlength="60" onchange="renameHabit('${h.id}', this.value)">
-            <span class="text-xs text-neutral-500 w-12 text-center">${h.category === 'workout' ? '💪' : '🌱'}</span>
-            <button onclick="toggleActive('${h.id}')" class="btn-ghost text-xs !px-3">${h.active ? 'Desativar' : 'Ativar'}</button>
-          </div>`).join('') : '<p class="text-sm text-neutral-500">Nenhum item.</p>'}
+      <div class="space-y-3">
+        ${mine.length ? mine.map(h => {
+          const ds = h.days_of_week || ALL_DAYS;
+          return `
+          <div class="space-y-1.5 pb-3 border-b border-[#1f1f1f] ${h.active ? '' : 'opacity-50'}">
+            <div class="flex items-center gap-2">
+              <input class="inp flex-1" value="${esc(h.title)}" maxlength="60" onchange="renameHabit('${h.id}', this.value)">
+              <span class="text-xs text-neutral-500 w-8 text-center">${h.category === 'workout' ? '💪' : '🌱'}</span>
+              <button onclick="toggleActive('${h.id}')" class="btn-ghost text-xs !px-3">${h.active ? 'Desativar' : 'Ativar'}</button>
+            </div>
+            <div class="flex gap-1.5">
+              ${DL.map((l, i) => `<button onclick="toggleDay('${h.id}', ${i})" class="w-8 h-8 rounded-full text-xs font-bold border ${ds.includes(i) ? 'bg-emerald-500 text-black border-emerald-500' : 'bg-[#0A0A0A] text-neutral-500 border-[#262626]'}">${l}</button>`).join('')}
+            </div>
+          </div>`;
+        }).join('') : '<p class="text-sm text-neutral-500">Nenhum item.</p>'}
       </div>`;
   } else if (S.modal === 'goal') {
+    const g = S.eg ? S.goals.find(x => x.id === S.eg) : null;
+    const sc = g && g.user_id === null ? 'couple' : 'me';
     inner = `
-      <h3 class="text-lg font-bold mb-3">Nova meta</h3>
+      <h3 class="text-lg font-bold mb-3">${g ? 'Editar meta' : 'Nova meta'}</h3>
       <div class="space-y-3">
-        <input id="gTitle" class="inp" placeholder="Título (ex: Ler livros)" maxlength="80">
+        <input id="gTitle" class="inp" placeholder="Título (ex: Ler livros)" maxlength="80" value="${g ? esc(g.title) : ''}">
         <div class="grid grid-cols-3 gap-2">
-          <input id="gCur" class="inp" inputmode="decimal" placeholder="Atual" value="0">
-          <input id="gTarget" class="inp" inputmode="decimal" placeholder="Alvo">
-          <input id="gUnit" class="inp" placeholder="Unidade" maxlength="12">
+          <input id="gCur" class="inp" inputmode="decimal" placeholder="Atual" value="${g ? Number(g.current_value) : 0}">
+          <input id="gTarget" class="inp" inputmode="decimal" placeholder="Alvo" value="${g ? Number(g.target_value) : ''}">
+          <input id="gUnit" class="inp" placeholder="Unidade" maxlength="12" value="${g ? esc(g.unit || '') : ''}">
         </div>
-        <select id="gScope" class="inp"><option value="me">Minha meta</option><option value="couple">Meta do casal</option></select>
-        <button onclick="createGoal()" class="btn w-full">Criar meta</button>
+        <select id="gScope" class="inp">
+          <option value="me" ${sc === 'me' ? 'selected' : ''}>Minha meta</option>
+          <option value="couple" ${sc === 'couple' ? 'selected' : ''}>Meta do casal</option>
+        </select>
+        <button onclick="saveGoal()" class="btn w-full">${g ? 'Salvar alterações' : 'Criar meta'}</button>
       </div>`;
   }
   m.innerHTML = `
@@ -495,6 +639,18 @@ async function toggleActive(id) {
   render(); renderModal();
   const { error } = await sb.from('habits').update({ active: h.active }).eq('id', id);
   if (error) { h.active = !h.active; render(); renderModal(); toast('Erro ao atualizar.', true); }
+}
+async function toggleDay(id, d) {
+  const h = habitById(id);
+  if (!h) return;
+  const cur = h.days_of_week || ALL_DAYS;
+  const next = cur.includes(d) ? cur.filter(x => x !== d) : [...cur, d].sort((a, b) => a - b);
+  if (!next.length) return toast('Selecione ao menos um dia.', true);
+  const old = h.days_of_week;
+  h.days_of_week = next;
+  render(); renderModal();
+  const { error } = await sb.from('habits').update({ days_of_week: next }).eq('id', id);
+  if (error) { h.days_of_week = old; render(); renderModal(); toast('Erro ao salvar dias.', true); }
 }
 
 // ----------------------- ABA RANKING -----------------------
@@ -534,7 +690,10 @@ function vGoals() {
     <div class="card p-4 ${g.completed ? 'border-emerald-500/40' : ''}">
       <div class="flex items-start justify-between gap-2">
         <div class="font-semibold">${g.completed ? '✅ ' : ''}${esc(g.title)}</div>
-        <button onclick="deleteGoal('${g.id}')" class="text-neutral-600 text-lg leading-none px-1">🗑</button>
+        <div class="flex items-center gap-1">
+          <button onclick="openGoal('${g.id}')" class="text-neutral-500 text-base leading-none px-1">✏️</button>
+          <button onclick="deleteGoal('${g.id}')" class="text-neutral-600 text-lg leading-none px-1">🗑</button>
+        </div>s
       </div>
       <div class="pb my-3"><div style="width:${pct}%"></div></div>
       <div class="flex items-center justify-between">
@@ -558,7 +717,7 @@ function vGoals() {
   return `
     <div class="flex items-center justify-between mb-4">
       <h1 class="text-xl font-bold">Metas</h1>
-      <button onclick="openModal('goal')" class="btn">+ Nova</button>
+      <button onclick="openGoal()" class="btn">+ Nova</button>
     </div>
     ${sec('💑 Metas do Casal', shared)}
     ${sec('🎯 Minhas Metas', mine)}
@@ -586,7 +745,7 @@ function setGoalValue(id) {
   const n = parseFloat(String(v).replace(',', '.'));
   if (!isNaN(n)) updateGoal(g, n);
 }
-async function createGoal() {
+async function saveGoal() {
   const title = $('gTitle').value.trim();
   const target = parseFloat($('gTarget').value.replace(',', '.'));
   const cur = parseFloat($('gCur').value.replace(',', '.')) || 0;
@@ -596,11 +755,19 @@ async function createGoal() {
     title, target_value: target, current_value: cur,
     unit: $('gUnit').value.trim(), completed: cur >= target
   };
-  const { data, error } = await sb.from('goals').insert(row).select().single();
-  if (error) return toast('Erro ao criar meta.', true);
-  S.goals.push(data);
+  if (S.eg) {
+    const { data, error } = await sb.from('goals').update(row).eq('id', S.eg).select().single();
+    if (error) return toast('Erro ao editar meta.', true);
+    const i = S.goals.findIndex(x => x.id === S.eg);
+    if (i >= 0) S.goals[i] = data;
+    toast('Meta atualizada ✓');
+  } else {
+    const { data, error } = await sb.from('goals').insert(row).select().single();
+    if (error) return toast('Erro ao criar meta.', true);
+    S.goals.push(data);
+    toast('Meta criada ✓');
+  }
   closeModal(); render();
-  toast('Meta criada ✓');
 }
 async function deleteGoal(id) {
   if (!confirm('Excluir esta meta?')) return;
@@ -662,8 +829,16 @@ function vProfile() {
 
   const note = `
     <div class="card p-4 mb-4">
-      <h3 class="font-semibold text-sm mb-2">📝 Nota recente${isMe ? '' : ' do parceiro'}</h3>
-      ${px && px.note ? `<div class="text-xs text-neutral-500 mb-1">${esc(fmtShort(px.note.note_date))}</div><p class="text-sm whitespace-pre-wrap">${esc(px.note.content)}</p>` : '<p class="text-sm text-neutral-500">Nenhuma nota registrada.</p>'}
+      <h3 class="font-semibold text-sm mb-3">📝 Notas recentes${isMe ? '' : ' do parceiro'}</h3>
+      ${px && px.notes.length ? `
+        <div class="relative pl-4 border-l border-[#262626] space-y-4 ml-1">
+          ${px.notes.map(n => `
+            <div class="relative">
+              <span class="absolute -left-[21px] top-1.5 w-2.5 h-2.5 rounded-full bg-emerald-500"></span>
+              <div class="text-xs text-neutral-500 mb-0.5">${esc(fmtShort(n.note_date))}</div>
+              <p class="text-sm whitespace-pre-wrap break-words">${esc(n.content)}</p>
+            </div>`).join('')}
+        </div>` : '<p class="text-sm text-neutral-500">Nenhuma nota registrada.</p>'}
     </div>`;
 
   const weight = `
