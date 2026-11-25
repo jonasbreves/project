@@ -80,7 +80,7 @@ const S = {
   date: null, tab: 'today', note: '', noteSaved: '',
   goals: [], pv: 'me', px: null, nudges: [], modal: null,
   cool: 0, started: false, poll: null,
-  filter: 'all', tasks: null, tdate: null, eg: null
+  filter: 'all', tasks: null, tdate: null, eg: null, orph: {}, prize: ''
 };
 try { S.cool = Number(localStorage.getItem('nudge_cool') || 0); } catch (e) {}
 
@@ -128,14 +128,45 @@ const ALL_DAYS = [0,1,2,3,4,5,6];
 const DL = ['D','S','T','Q','Q','S','S'];
 const dow = s => parseD(s).getDay();
 const scheduled = (uid, date) => activeHabits(uid).filter(h => (h.days_of_week || ALL_DAYS).includes(dow(date)));
+const habDay = h => h.created_at ? ymd(new Date(h.created_at)) : '0000-00-00';
+
+// logs órfãos (hábito excluído): snapshot guardado em habit_logs
+let orphSeq = 0;
+function addOrphan(o) { (S.orph[o.user_id + '|' + o.log_date] ||= []).push(o); }
+
+// Itens considerados no dia:
+// - hoje/futuro: apenas hábitos ativos e programados;
+// - passado: ativos programados (que já existiam na data) + tudo que foi concluído (mesmo desativado/excluído).
+function dayItems(uid, date) {
+  const past = date < today();
+  const items = [], seen = new Set();
+  for (const h of scheduled(uid, date)) {
+    const dn = S.done.has(h.id + '|' + date);
+    if (past && habDay(h) > date && !dn) continue; // hábito criado depois do dia: não penaliza
+    seen.add(h.id);
+    items.push({ id: h.id, title: h.title, category: h.category, done: dn });
+  }
+  if (past) {
+    for (const h of S.habits) {
+      if (h.user_id === uid && !seen.has(h.id) && S.done.has(h.id + '|' + date)) {
+        seen.add(h.id);
+        items.push({ id: h.id, title: h.title, category: h.category, done: true });
+      }
+    }
+    for (const o of (S.orph[uid + '|' + date] || [])) {
+      items.push({ id: null, key: 'o' + (orphSeq++), title: o.title || 'Item removido', category: o.category || 'habit', done: true });
+    }
+  }
+  return items;
+}
 
 function dayPct(uid, date) {
-  if (!activeHabits(uid).length) return 0;
-  const hs = scheduled(uid, date);
-  if (!hs.length) return 1; // dia sem itens programados = dia de descanso (não quebra streak)
-  let c = 0;
-  for (const h of hs) if (S.done.has(h.id + '|' + date)) c++;
-  return c / hs.length;
+  const items = dayItems(uid, date);
+  if (!items.length) {
+    // dia de descanso (nada programado) não quebra streak; antes de existir qualquer hábito = 0
+    return activeHabits(uid).some(h => habDay(h) <= date) ? 1 : 0;
+  }
+  return items.filter(i => i.done).length / items.length;
 }
 function rangePct(uid, days) {
   let s = 0;
@@ -157,6 +188,10 @@ function workouts(uid, days) {
     const [hid, dt] = k.split('|');
     if (dt >= from && hs.some(h => h.id === hid)) c++;
   }
+  for (const k in S.orph) {
+    const [u, dt] = k.split('|');
+    if (u === uid && dt >= from) c += S.orph[k].filter(o => o.category === 'workout').length;
+  }
   return c;
 }
 function overallPct(uid) {
@@ -165,6 +200,10 @@ function overallPct(uid) {
   for (const k of S.done) {
     const [hid, dt] = k.split('|');
     if (ids.has(hid) && (!first || dt < first)) first = dt;
+  }
+  for (const k in S.orph) {
+    const [u, dt] = k.split('|');
+    if (u === uid && (!first || dt < first)) first = dt;
   }
   if (!first) return 0;
   const days = Math.min(1500, Math.max(1, Math.round((parseD(today()) - parseD(first)) / 86400000) + 1));
@@ -218,6 +257,7 @@ async function start(user) {
   $('app').classList.remove('hidden');
   try {
     await loadAll();
+    await loadPrize();
     await loadNote();
     render();
     clearInterval(S.poll);
@@ -234,7 +274,7 @@ async function loadAll() {
   const [pr, hb, lg, gl, nd] = await Promise.all([
     sb.from('profiles').select('*'),
     sb.from('habits').select('*').order('created_at'),
-    fetchAll(() => sb.from('habit_logs').select('habit_id,log_date').eq('completed', true).order('log_date').order('habit_id')),
+    fetchAll(() => sb.from('habit_logs').select('habit_id,log_date,user_id,habit_title,habit_category').eq('completed', true).order('log_date').order('id')),
     sb.from('goals').select('*').or('user_id.is.null,user_id.eq.' + S.uid).order('title'),
     sb.from('nudges').select('*').eq('receiver_id', S.uid).eq('seen', false).order('created_at', { ascending: false })
   ]);
@@ -247,7 +287,9 @@ async function loadAll() {
     if (data) S.profiles.push(data);
   }
   S.habits = hb.data || [];
-  S.done = new Set(lg.map(r => r.habit_id + '|' + r.log_date));
+  S.done = new Set(lg.filter(r => r.habit_id).map(r => r.habit_id + '|' + r.log_date));
+  S.orph = {};
+  lg.filter(r => !r.habit_id).forEach(r => addOrphan({ user_id: r.user_id, log_date: r.log_date, title: r.habit_title, category: r.habit_category }));
   S.goals = gl.data || [];
   S.nudges = nd.data || [];
 }
@@ -285,9 +327,9 @@ const TABS = [['today', 'Hoje', '✅'], ['tasks', 'Tarefas', '📋'], ['rank', '
 
 function setTab(t) {
   S.tab = t;
+  if (t === 'rank') loadPrize().then(() => { if (S.tab === 'rank') render(); });
   if (t === 'profile') { S.px = null; loadPx(); }
   if (t === 'tasks') { S.tdate = S.date; S.tasks = null; loadTasks(); }
-  if (t === 'rank') loadPerk();
   render();
   window.scrollTo(0, 0);
 }
@@ -333,14 +375,19 @@ function render() {
 
 // ----------------------- ABA HOJE -----------------------
 function vToday() {
-  const hs = scheduled(S.uid, S.date);
-  const hab = hs.filter(h => h.category === 'habit');
+  const hs = dayItems(S.uid, S.date);
+  const hab = hs.filter(h => h.category !== 'workout');
   const wk = hs.filter(h => h.category === 'workout');
-  const dn = hs.filter(h => S.done.has(h.id + '|' + S.date)).length;
+  const dn = hs.filter(h => h.done).length;
   const pct = hs.length ? Math.round(dn / hs.length * 100) : 0;
   const isT = S.date === today();
   const item = h => {
-    const on = S.done.has(h.id + '|' + S.date);
+    const on = h.done;
+    if (!h.id) return `<div class="w-full flex items-center gap-3 px-4 py-2.5 rounded-2xl border border-[#1f1f1f] opacity-60">
+      <span class="chk on" style="width:20px;height:20px"><svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="#04130D" stroke-width="4" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12l5 5L20 7"/></svg></span>
+      <span class="flex-1 text-sm text-neutral-500">${esc(h.title)}</span>
+      <span class="text-[10px] text-neutral-600">removido</span>
+    </div>`;
     return `<button onclick="toggleHabit('${h.id}')" class="item w-full flex items-center gap-3 text-left card px-4 py-3.5 ${on ? 'border-emerald-500/40 bg-emerald-500/5' : ''}">
       <span class="chk ${on ? 'on' : ''}">${on ? '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="#04130D" stroke-width="4" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12l5 5L20 7"/></svg>' : ''}</span>
       <span class="flex-1 ${on ? 'text-neutral-400 line-through decoration-neutral-600' : ''}">${esc(h.title)}</span>
@@ -414,8 +461,9 @@ async function toggleHabit(id) {
   const before = dayPct(S.uid, date);
   was ? S.done.delete(key) : S.done.add(key);
   render();
+  const h0 = habitById(id);
   const { error } = await sb.from('habit_logs').upsert(
-    { habit_id: id, user_id: S.uid, log_date: date, completed: !was },
+    { habit_id: id, user_id: S.uid, log_date: date, completed: !was, habit_title: h0 ? h0.title : null, habit_category: h0 ? h0.category : null },
     { onConflict: 'habit_id,log_date' }
   );
   if (error) {
@@ -561,9 +609,6 @@ function renderModal() {
   const m = $('modal');
   if (!S.modal) { m.innerHTML = ''; document.body.style.overflow = ''; return; }
   document.body.style.overflow = 'hidden';
-  const oldBox = $('modalScroll');
-  const st = oldBox ? oldBox.scrollTop : 0;
-  const reopen = !!oldBox;
   let inner = '';
   if (S.modal === 'manage') {
     const mine = S.habits.filter(h => h.user_id === S.uid);
@@ -581,9 +626,9 @@ function renderModal() {
           <div class="space-y-1.5 pb-3 border-b border-[#1f1f1f] ${h.active ? '' : 'opacity-50'}">
             <div class="flex items-center gap-2">
               <input class="inp flex-1" value="${esc(h.title)}" maxlength="60" onchange="renameHabit('${h.id}', this.value)">
-              <span class="text-xs text-neutral-500 w-6 text-center">${h.category === 'workout' ? '💪' : '🌱'}</span>
+              <span class="text-xs text-neutral-500 w-8 text-center">${h.category === 'workout' ? '💪' : '🌱'}</span>
               <button onclick="toggleActive('${h.id}')" class="btn-ghost text-xs !px-3">${h.active ? 'Desativar' : 'Ativar'}</button>
-              <button onclick="deleteHabit('${h.id}')" class="text-neutral-500 text-lg leading-none px-1" title="Excluir">🗑️</button>
+              <button onclick="deleteHabit('${h.id}')" class="text-neutral-600 text-lg leading-none px-1">🗑</button>
             </div>
             <div class="flex gap-1.5">
               ${DL.map((l, i) => `<button onclick="toggleDay('${h.id}', ${i})" class="w-8 h-8 rounded-full text-xs font-bold border ${ds.includes(i) ? 'bg-emerald-500 text-black border-emerald-500' : 'bg-[#0A0A0A] text-neutral-500 border-[#262626]'}">${l}</button>`).join('')}
@@ -611,14 +656,12 @@ function renderModal() {
       </div>`;
   }
   m.innerHTML = `
-    <div class="fixed inset-0 z-50 bg-black/70 flex items-end md:items-center justify-center ${reopen ? '' : 'fade'}" onclick="if(event.target===this)closeModal()">
-      <div id="modalScroll" class="w-full md:max-w-md bg-[#141414] border border-[#262626] rounded-t-3xl md:rounded-3xl p-5 max-h-[88vh] overflow-y-auto safe-b">
+    <div class="fixed inset-0 z-50 bg-black/70 flex items-end md:items-center justify-center fade" onclick="if(event.target===this)closeModal()">
+      <div class="w-full md:max-w-md bg-[#141414] border border-[#262626] rounded-t-3xl md:rounded-3xl p-5 max-h-[88vh] overflow-y-auto safe-b">
         <div class="flex justify-end -mb-6"><button onclick="closeModal()" class="text-neutral-500 text-2xl leading-none px-2">×</button></div>
         ${inner}
       </div>
     </div>`;
-  const box = $('modalScroll');
-  if (box && reopen) box.scrollTop = st;
 }
 
 async function addHabit() {
@@ -647,6 +690,18 @@ async function toggleActive(id) {
   const { error } = await sb.from('habits').update({ active: h.active }).eq('id', id);
   if (error) { h.active = !h.active; render(); renderModal(); toast('Erro ao atualizar.', true); }
 }
+async function deleteHabit(id) {
+  const h = habitById(id);
+  if (!h || !confirm('Excluir "' + h.title + '"? O histórico já concluído será mantido.')) return;
+  for (const k of [...S.done]) {
+    const [hid, dt] = k.split('|');
+    if (hid === id) { S.done.delete(k); addOrphan({ user_id: S.uid, log_date: dt, title: h.title, category: h.category }); }
+  }
+  S.habits = S.habits.filter(x => x.id !== id);
+  render(); renderModal();
+  const { error } = await sb.from('habits').delete().eq('id', id);
+  if (error) { await loadAll(); render(); renderModal(); toast('Erro ao excluir.', true); }
+}
 async function toggleDay(id, d) {
   const h = habitById(id);
   if (!h) return;
@@ -660,66 +715,47 @@ async function toggleDay(id, d) {
   if (error) { h.days_of_week = old; render(); renderModal(); toast('Erro ao salvar dias.', true); }
 }
 
-async function deleteHabit(id) {
-  const h = habitById(id);
-  if (!h) return;
-  if (!confirm('Excluir "' + h.title + '" e todo o histórico dele?')) return;
-  const idx = S.habits.findIndex(x => x.id === id);
-  const [removed] = S.habits.splice(idx, 1);
-  const removedKeys = [...S.done].filter(k => k.startsWith(id + '|'));
-  removedKeys.forEach(k => S.done.delete(k));
-  render(); renderModal();
-  const { error } = await sb.from('habits').delete().eq('id', id);
-  if (error) {
-    S.habits.splice(idx, 0, removed);
-    removedKeys.forEach(k => S.done.add(k));
-    render(); renderModal();
-    toast('Erro ao excluir.', true);
-  }
+async function loadPrize() {
+  const { data } = await sb.from('app_settings').select('value').eq('key', 'prize').maybeSingle();
+  S.prize = (data && data.value) || '';
 }
-
-const weekStart = () => { const t = today(); return addDays(t, -((dow(t) + 6) % 7)); };
-const weekKey = () => weekStart();
-function weekPct(uid) {
-  const n = (dow(today()) + 6) % 7 + 1;
-  let s = 0;
-  for (let i = 0; i < n; i++) s += dayPct(uid, addDays(weekStart(), i));
-  return s / n;
-}
-async function loadPerk() {
-  const k = weekKey();
-  const { data } = await sb.from('weekly_perks').select('*').eq('week_key', k).maybeSingle();
-  S.perk = data || { week_key: k, perk_text: '' };
-  S.perkDraft = null;
-  if (S.tab === 'rank') render();
-}
-async function savePerk() {
-  const text = (S.perkDraft ?? (S.perk && S.perk.perk_text) ?? '').trim();
-  const { data, error } = await sb.from('weekly_perks').upsert(
-    { week_key: weekKey(), perk_text: text, updated_by: S.uid, updated_at: new Date().toISOString() },
-    { onConflict: 'week_key' }
-  ).select().single();
-  if (error) return toast('Erro ao salvar o direito da semana.', true);
-  S.perk = data; S.perkDraft = null;
-  render();
-  toast('Direito salvo ✓');
+async function savePrize() {
+  const v = $('prizeIn').value.trim();
+  const { error } = await sb.from('app_settings').upsert({ key: 'prize', value: v, updated_at: new Date().toISOString() }, { onConflict: 'key' });
+  if (error) return toast('Erro ao salvar prêmio.', true);
+  S.prize = v; render(); toast('Prêmio salvo ✓');
 }
 
 // ----------------------- ABA RANKING -----------------------
 function vRank() {
   const ps = [me(), partner()].filter(Boolean);
-  const stats = ps.map(p => ({ p, w: rangePct(p.id, 7), m: rangePct(p.id, 30), s: streak(p.id), t: workouts(p.id, 30), wk: weekPct(p.id) }));
-  let leader = null, loser = null;
-  if (stats.length === 2 && stats[0].w !== stats[1].w) leader = stats[0].w > stats[1].w ? stats[0].p.id : stats[1].p.id;
-  if (stats.length === 2 && stats[0].wk !== stats[1].wk) loser = stats[0].wk < stats[1].wk ? stats[0].p : stats[1].p;
-  const isClose = dow(today()) === 0; // domingo = fechamento da semana
+  const stats = ps.map(p => ({ p, w: rangePct(p.id, 7), m: rangePct(p.id, 30), s: streak(p.id), t: workouts(p.id, 30) }));
+  // Líder = maior % semanal (comparado pelo valor exibido); desempate: mensal, streak, treinos
+  const key = st => [Math.round(st.w * 100), Math.round(st.m * 100), st.s, st.t];
+  const cmp = (a, b) => { const ka = key(a), kb = key(b); for (let i = 0; i < ka.length; i++) if (ka[i] !== kb[i]) return ka[i] - kb[i]; return 0; };
+  let leader = null;
+  if (stats.length === 2) {
+    const c = cmp(stats[0], stats[1]);
+    if (c !== 0) leader = (c > 0 ? stats[0] : stats[1]).p.id;
+  }
+    const lead = stats.find(s => s.p.id === leader);
+  const prizeBox = stats.length < 2 ? '' : `
+    <div class="card p-4 mb-4 ${lead ? 'border-emerald-500/50 bg-emerald-500/5' : ''}">
+      <div class="text-xs uppercase tracking-wider text-neutral-500 font-semibold mb-2 text-center">🏆 Prêmio da semana</div>
+      <div class="flex gap-2">
+        <input id="prizeIn" class="inp flex-1" maxlength="120" placeholder="Qual é o prêmio?" value="${esc(S.prize)}">
+        <button onclick="savePrize()" class="btn">Salvar</button>
+      </div>
+      <div class="text-sm mt-3 text-center">${lead
+        ? `👑 <b>${esc(lead.p.name || 'Sem nome')}</b> está ganhando com <b>${pctTxt(lead.w)}</b> na semana`
+        : 'Empate por enquanto. Ninguém está ganhando ainda.'}</div>
+    </div>`;
   const bar = v => `<div class="pb mt-1"><div style="width:${Math.round(v * 100)}%"></div></div>`;
   const card = st => `
-    <div class="card p-4 text-center ${st.p.id === leader ? 'border-emerald-500/50' : ''} ${loser && st.p.id === loser.id ? '!border-amber-500/60' : ''}">
+    <div class="card p-4 text-center ${st.p.id === leader ? 'border-emerald-500/50' : ''}">
       <div class="flex justify-center mb-2">${av(st.p, 64)}</div>
       <div class="font-bold truncate">${esc(st.p.name || 'Sem nome')} ${st.p.id === leader ? '👑' : ''}</div>
-      <div class="text-xs text-neutral-500 mb-2">${st.p.id === S.uid ? 'Você' : 'Parceiro(a)'}</div>
-      ${loser && st.p.id === loser.id ? `<div class="text-[11px] font-semibold text-amber-300 bg-amber-500/10 border border-amber-500/30 rounded-lg px-2 py-1 mb-2">🎁 ${isClose ? 'Perdeu a semana' : 'Atrás na semana'} · tem direito</div>` : '<div class="mb-2"></div>'}
+      <div class="text-xs text-neutral-500 mb-3">${st.p.id === S.uid ? 'Você' : 'Parceiro(a)'}</div>
       <div class="text-left space-y-3">
         <div><div class="flex justify-between text-xs text-neutral-400"><span>Semanal</span><b class="text-emerald-400 text-base">${pctTxt(st.w)}</b></div>${bar(st.w)}</div>
         <div><div class="flex justify-between text-xs text-neutral-400"><span>Mensal</span><b class="text-emerald-400 text-base">${pctTxt(st.m)}</b></div>${bar(st.m)}</div>
@@ -727,26 +763,11 @@ function vRank() {
         <div class="flex justify-between text-sm"><span class="text-neutral-400">💪 Treinos (30d)</span><b>${st.t}</b></div>
       </div>
     </div>`;
-  const perkVal = S.perkDraft ?? ((S.perk && S.perk.perk_text) || '');
-  const perk = `
-    <div class="card p-4 mt-4 ${loser ? 'border-amber-500/40' : ''}">
-      <label class="text-xs uppercase tracking-wider text-neutral-500 font-semibold">🎁 Direito de quem perder na semana</label>
-      <p class="text-[11px] text-neutral-600 mt-1">Semana de ${esc(fmtShort(weekStart()))} a ${esc(fmtShort(addDays(weekStart(), 6)))} (seg–dom)</p>
-      <div class="flex gap-2 mt-2 items-start">
-        <textarea rows="2" maxlength="200" oninput="S.perkDraft=this.value" placeholder="Ex: escolher o filme, pedir o lanche, massagem…" class="inp flex-1 resize-none">${esc(perkVal)}</textarea>
-        <button onclick="savePerk()" class="btn">Salvar</button>
-      </div>
-      <div class="text-sm mt-3 ${loser ? 'text-amber-300' : 'text-neutral-500'}">
-        ${loser
-          ? `${isClose ? '🏁' : '⏳'} <b>${esc(loser.name || 'Alguém')}</b> ${isClose ? 'perdeu o fechamento e tem direito a' : 'está atrás e ganha, se mantiver,'}: <b>${esc((S.perk && S.perk.perk_text) || 'definir o prêmio acima')}</b>`
-          : stats.length === 2 ? 'Empate na semana — ninguém tem direito (ainda).' : ''}
-      </div>
-    </div>`;
   return `
     <h1 class="text-xl font-bold mb-1">Ranking</h1>
-    <p class="text-xs text-neutral-500 mb-4">Percentual de hábitos/treinos ativos concluídos. Streak: dias seguidos com ≥ 80%.</p>
+    <p class="text-xs text-neutral-500 mb-4">Percentual de hábitos/treinos concluídos. 👑 = maior % semanal (desempate: mensal, streak, treinos). Streak: dias seguidos com ≥ 80%.</p>
+    ${prizeBox}
     <div class="grid grid-cols-2 gap-3">${stats.map(card).join('')}</div>
-    ${stats.length === 2 ? perk : ''}
     ${stats.length < 2 ? '<p class="text-sm text-neutral-500 text-center mt-6">Aguardando o segundo perfil ser criado no Supabase.</p>' : ''}`;
 }
 
@@ -764,7 +785,7 @@ function vGoals() {
         <div class="flex items-center gap-1">
           <button onclick="openGoal('${g.id}')" class="text-neutral-500 text-base leading-none px-1">✏️</button>
           <button onclick="deleteGoal('${g.id}')" class="text-neutral-600 text-lg leading-none px-1">🗑</button>
-        </div>s
+        </div>
       </div>
       <div class="pb my-3"><div style="width:${pct}%"></div></div>
       <div class="flex items-center justify-between">
