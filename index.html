@@ -287,6 +287,7 @@ function setTab(t) {
   S.tab = t;
   if (t === 'profile') { S.px = null; loadPx(); }
   if (t === 'tasks') { S.tdate = S.date; S.tasks = null; loadTasks(); }
+  if (t === 'rank') loadPerk();
   render();
   window.scrollTo(0, 0);
 }
@@ -560,6 +561,9 @@ function renderModal() {
   const m = $('modal');
   if (!S.modal) { m.innerHTML = ''; document.body.style.overflow = ''; return; }
   document.body.style.overflow = 'hidden';
+  const oldBox = $('modalScroll');
+  const st = oldBox ? oldBox.scrollTop : 0;
+  const reopen = !!oldBox;
   let inner = '';
   if (S.modal === 'manage') {
     const mine = S.habits.filter(h => h.user_id === S.uid);
@@ -577,8 +581,9 @@ function renderModal() {
           <div class="space-y-1.5 pb-3 border-b border-[#1f1f1f] ${h.active ? '' : 'opacity-50'}">
             <div class="flex items-center gap-2">
               <input class="inp flex-1" value="${esc(h.title)}" maxlength="60" onchange="renameHabit('${h.id}', this.value)">
-              <span class="text-xs text-neutral-500 w-8 text-center">${h.category === 'workout' ? '💪' : '🌱'}</span>
+              <span class="text-xs text-neutral-500 w-6 text-center">${h.category === 'workout' ? '💪' : '🌱'}</span>
               <button onclick="toggleActive('${h.id}')" class="btn-ghost text-xs !px-3">${h.active ? 'Desativar' : 'Ativar'}</button>
+              <button onclick="deleteHabit('${h.id}')" class="text-neutral-500 text-lg leading-none px-1" title="Excluir">🗑️</button>
             </div>
             <div class="flex gap-1.5">
               ${DL.map((l, i) => `<button onclick="toggleDay('${h.id}', ${i})" class="w-8 h-8 rounded-full text-xs font-bold border ${ds.includes(i) ? 'bg-emerald-500 text-black border-emerald-500' : 'bg-[#0A0A0A] text-neutral-500 border-[#262626]'}">${l}</button>`).join('')}
@@ -606,12 +611,14 @@ function renderModal() {
       </div>`;
   }
   m.innerHTML = `
-    <div class="fixed inset-0 z-50 bg-black/70 flex items-end md:items-center justify-center fade" onclick="if(event.target===this)closeModal()">
-      <div class="w-full md:max-w-md bg-[#141414] border border-[#262626] rounded-t-3xl md:rounded-3xl p-5 max-h-[88vh] overflow-y-auto safe-b">
+    <div class="fixed inset-0 z-50 bg-black/70 flex items-end md:items-center justify-center ${reopen ? '' : 'fade'}" onclick="if(event.target===this)closeModal()">
+      <div id="modalScroll" class="w-full md:max-w-md bg-[#141414] border border-[#262626] rounded-t-3xl md:rounded-3xl p-5 max-h-[88vh] overflow-y-auto safe-b">
         <div class="flex justify-end -mb-6"><button onclick="closeModal()" class="text-neutral-500 text-2xl leading-none px-2">×</button></div>
         ${inner}
       </div>
     </div>`;
+  const box = $('modalScroll');
+  if (box && reopen) box.scrollTop = st;
 }
 
 async function addHabit() {
@@ -653,18 +660,66 @@ async function toggleDay(id, d) {
   if (error) { h.days_of_week = old; render(); renderModal(); toast('Erro ao salvar dias.', true); }
 }
 
+async function deleteHabit(id) {
+  const h = habitById(id);
+  if (!h) return;
+  if (!confirm('Excluir "' + h.title + '" e todo o histórico dele?')) return;
+  const idx = S.habits.findIndex(x => x.id === id);
+  const [removed] = S.habits.splice(idx, 1);
+  const removedKeys = [...S.done].filter(k => k.startsWith(id + '|'));
+  removedKeys.forEach(k => S.done.delete(k));
+  render(); renderModal();
+  const { error } = await sb.from('habits').delete().eq('id', id);
+  if (error) {
+    S.habits.splice(idx, 0, removed);
+    removedKeys.forEach(k => S.done.add(k));
+    render(); renderModal();
+    toast('Erro ao excluir.', true);
+  }
+}
+
+const weekStart = () => { const t = today(); return addDays(t, -((dow(t) + 6) % 7)); };
+const weekKey = () => weekStart();
+function weekPct(uid) {
+  const n = (dow(today()) + 6) % 7 + 1;
+  let s = 0;
+  for (let i = 0; i < n; i++) s += dayPct(uid, addDays(weekStart(), i));
+  return s / n;
+}
+async function loadPerk() {
+  const k = weekKey();
+  const { data } = await sb.from('weekly_perks').select('*').eq('week_key', k).maybeSingle();
+  S.perk = data || { week_key: k, perk_text: '' };
+  S.perkDraft = null;
+  if (S.tab === 'rank') render();
+}
+async function savePerk() {
+  const text = (S.perkDraft ?? (S.perk && S.perk.perk_text) ?? '').trim();
+  const { data, error } = await sb.from('weekly_perks').upsert(
+    { week_key: weekKey(), perk_text: text, updated_by: S.uid, updated_at: new Date().toISOString() },
+    { onConflict: 'week_key' }
+  ).select().single();
+  if (error) return toast('Erro ao salvar o direito da semana.', true);
+  S.perk = data; S.perkDraft = null;
+  render();
+  toast('Direito salvo ✓');
+}
+
 // ----------------------- ABA RANKING -----------------------
 function vRank() {
   const ps = [me(), partner()].filter(Boolean);
-  const stats = ps.map(p => ({ p, w: rangePct(p.id, 7), m: rangePct(p.id, 30), s: streak(p.id), t: workouts(p.id, 30) }));
-  let leader = null;
+  const stats = ps.map(p => ({ p, w: rangePct(p.id, 7), m: rangePct(p.id, 30), s: streak(p.id), t: workouts(p.id, 30), wk: weekPct(p.id) }));
+  let leader = null, loser = null;
   if (stats.length === 2 && stats[0].w !== stats[1].w) leader = stats[0].w > stats[1].w ? stats[0].p.id : stats[1].p.id;
+  if (stats.length === 2 && stats[0].wk !== stats[1].wk) loser = stats[0].wk < stats[1].wk ? stats[0].p : stats[1].p;
+  const isClose = dow(today()) === 0; // domingo = fechamento da semana
   const bar = v => `<div class="pb mt-1"><div style="width:${Math.round(v * 100)}%"></div></div>`;
   const card = st => `
-    <div class="card p-4 text-center ${st.p.id === leader ? 'border-emerald-500/50' : ''}">
+    <div class="card p-4 text-center ${st.p.id === leader ? 'border-emerald-500/50' : ''} ${loser && st.p.id === loser.id ? '!border-amber-500/60' : ''}">
       <div class="flex justify-center mb-2">${av(st.p, 64)}</div>
       <div class="font-bold truncate">${esc(st.p.name || 'Sem nome')} ${st.p.id === leader ? '👑' : ''}</div>
-      <div class="text-xs text-neutral-500 mb-3">${st.p.id === S.uid ? 'Você' : 'Parceiro(a)'}</div>
+      <div class="text-xs text-neutral-500 mb-2">${st.p.id === S.uid ? 'Você' : 'Parceiro(a)'}</div>
+      ${loser && st.p.id === loser.id ? `<div class="text-[11px] font-semibold text-amber-300 bg-amber-500/10 border border-amber-500/30 rounded-lg px-2 py-1 mb-2">🎁 ${isClose ? 'Perdeu a semana' : 'Atrás na semana'} · tem direito</div>` : '<div class="mb-2"></div>'}
       <div class="text-left space-y-3">
         <div><div class="flex justify-between text-xs text-neutral-400"><span>Semanal</span><b class="text-emerald-400 text-base">${pctTxt(st.w)}</b></div>${bar(st.w)}</div>
         <div><div class="flex justify-between text-xs text-neutral-400"><span>Mensal</span><b class="text-emerald-400 text-base">${pctTxt(st.m)}</b></div>${bar(st.m)}</div>
@@ -672,10 +727,26 @@ function vRank() {
         <div class="flex justify-between text-sm"><span class="text-neutral-400">💪 Treinos (30d)</span><b>${st.t}</b></div>
       </div>
     </div>`;
+  const perkVal = S.perkDraft ?? ((S.perk && S.perk.perk_text) || '');
+  const perk = `
+    <div class="card p-4 mt-4 ${loser ? 'border-amber-500/40' : ''}">
+      <label class="text-xs uppercase tracking-wider text-neutral-500 font-semibold">🎁 Direito de quem perder na semana</label>
+      <p class="text-[11px] text-neutral-600 mt-1">Semana de ${esc(fmtShort(weekStart()))} a ${esc(fmtShort(addDays(weekStart(), 6)))} (seg–dom)</p>
+      <div class="flex gap-2 mt-2 items-start">
+        <textarea rows="2" maxlength="200" oninput="S.perkDraft=this.value" placeholder="Ex: escolher o filme, pedir o lanche, massagem…" class="inp flex-1 resize-none">${esc(perkVal)}</textarea>
+        <button onclick="savePerk()" class="btn">Salvar</button>
+      </div>
+      <div class="text-sm mt-3 ${loser ? 'text-amber-300' : 'text-neutral-500'}">
+        ${loser
+          ? `${isClose ? '🏁' : '⏳'} <b>${esc(loser.name || 'Alguém')}</b> ${isClose ? 'perdeu o fechamento e tem direito a' : 'está atrás e ganha, se mantiver,'}: <b>${esc((S.perk && S.perk.perk_text) || 'definir o prêmio acima')}</b>`
+          : stats.length === 2 ? 'Empate na semana — ninguém tem direito (ainda).' : ''}
+      </div>
+    </div>`;
   return `
     <h1 class="text-xl font-bold mb-1">Ranking</h1>
     <p class="text-xs text-neutral-500 mb-4">Percentual de hábitos/treinos ativos concluídos. Streak: dias seguidos com ≥ 80%.</p>
     <div class="grid grid-cols-2 gap-3">${stats.map(card).join('')}</div>
+    ${stats.length === 2 ? perk : ''}
     ${stats.length < 2 ? '<p class="text-sm text-neutral-500 text-center mt-6">Aguardando o segundo perfil ser criado no Supabase.</p>' : ''}`;
 }
 
