@@ -34,6 +34,7 @@
   .fade { animation: fade .25s ease; }
   @keyframes fade { from { opacity:0; transform:translateY(6px);} to { opacity:1; transform:none; } }
   input[type=date]::-webkit-calendar-picker-indicator { filter: invert(1); }
+  .gray { filter: grayscale(1); }
 </style>
 </head>
 <body class="min-h-screen">
@@ -80,7 +81,10 @@ const S = {
   date: null, tab: 'today', note: '', noteSaved: '',
   goals: [], pv: 'me', px: null, nudges: [], modal: null,
   cool: 0, started: false, poll: null,
-  filter: 'all', tasks: null, tdate: null, eg: null, orph: {}, prize: ''
+  filter: 'all', tasks: null, tdate: null, eg: null, orph: {}, prize: '',
+  // semana real / resumo / conquistas
+  results: [], ach: [], astats: null, sw: null,
+  extrasOk: false, achBusy: false, settledFor: null
 };
 try { S.cool = Number(localStorage.getItem('nudge_cool') || 0); } catch (e) {}
 
@@ -212,6 +216,353 @@ function overallPct(uid) {
 const bmi = p => (p && p.weight && p.height) ? p.weight / Math.pow(p.height / 100, 2) : null;
 const bmiLabel = v => v < 18.5 ? 'Abaixo do peso' : v < 25 ? 'Peso normal' : v < 30 ? 'Sobrepeso' : 'Obesidade';
 
+// =====================================================================
+// SEMANA REAL (seg–dom) · RESUMO SEMANAL · CONQUISTAS
+// =====================================================================
+const weekStart = s => addDays(s, -((dow(s) + 6) % 7));       // segunda-feira da semana de s
+const fmtRange = ws => fmtShort(ws) + ' – ' + fmtShort(addDays(ws, 6));
+
+// primeira data com algum check do usuário (ou null)
+function firstDate(uid) {
+  let first = null;
+  for (const k of S.done) {
+    const [hid, dt] = k.split('|');
+    const h = habitById(hid);
+    if (h && h.user_id === uid && (!first || dt < first)) first = dt;
+  }
+  for (const k in S.orph) {
+    const [u, dt] = k.split('|');
+    if (u === uid && (!first || dt < first)) first = dt;
+  }
+  return first;
+}
+// média de dayPct entre duas datas (inclusive)
+function rangeAvg(uid, from, to) {
+  let s = 0, n = 0;
+  for (let d = from; d <= to; d = addDays(d, 1)) { s += dayPct(uid, d); n++; }
+  return n ? s / n : 0;
+}
+// treinos concluídos entre duas datas (inclusive)
+function workoutsBetween(uid, from, to) {
+  let c = 0;
+  for (const k of S.done) {
+    const [hid, dt] = k.split('|');
+    if (dt < from || dt > to) continue;
+    const h = habitById(hid);
+    if (h && h.user_id === uid && h.category === 'workout') c++;
+  }
+  for (const k in S.orph) {
+    const [u, dt] = k.split('|');
+    if (u === uid && dt >= from && dt <= to) c += S.orph[k].filter(o => o.category === 'workout').length;
+  }
+  return c;
+}
+// placar da semana de um usuário (semana em andamento conta só até hoje)
+function weekScore(uid, ws) {
+  const end = addDays(ws, 6), to = end > today() ? today() : end;
+  return { pct: Math.round(rangeAvg(uid, ws, to) * 100), wk: workoutsBetween(uid, ws, to) };
+}
+// vencedor: maior % da semana; desempate: treinos; senão empate (null)
+function pickWinner(scores) {
+  const ids = Object.keys(scores);
+  if (ids.length < 2) return null;
+  const [a, b] = ids, A = scores[a], B = scores[b];
+  if (A.pct !== B.pct) return A.pct > B.pct ? a : b;
+  if (A.wk !== B.wk) return A.wk > B.wk ? a : b;
+  return null;
+}
+
+async function loadExtras() {
+  const [r, a] = await Promise.all([
+    sb.from('weekly_results').select('*').order('week_start', { ascending: false }),
+    sb.from('achievements').select('*')
+  ]);
+  S.extrasOk = !r.error && !a.error;
+  if (!S.extrasOk) console.warn('Tabelas weekly_results/achievements indisponíveis. Rode a migração SQL.', r.error || a.error);
+  S.results = r.data || [];
+  S.ach = a.data || [];
+}
+
+// Fecha semanas passadas que ainda não têm resultado registrado.
+// O primeiro aparelho a abrir o app depois da virada grava; os demais ignoram (insert ignora duplicados).
+async function settleWeeks() {
+  if (!S.extrasOk || S.profiles.length < 2) return;
+  await loadPrize();
+  const cur = weekStart(today()), lastWeek = addDays(cur, -7);
+  const have = new Set(S.results.map(r => r.week_start));
+  let first = null;
+  for (const p of S.profiles) { const f = firstDate(p.id); if (f && (!first || f < first)) first = f; }
+  if (!first) { S.settledFor = cur; return; }
+  let ws = weekStart(first);
+  const minWs = addDays(cur, -7 * 26);
+  if (ws < minWs) ws = minWs;
+  const rows = [];
+  for (; ws < cur; ws = addDays(ws, 7)) {
+    if (have.has(ws)) continue;
+    const scores = {};
+    for (const p of S.profiles) scores[p.id] = weekScore(p.id, ws);
+    if (Object.values(scores).every(s => s.pct === 0 && s.wk === 0)) continue;
+    rows.push({ week_start: ws, winner_id: pickWinner(scores), scores, prize: ws === lastWeek ? (S.prize || '') : '' });
+  }
+  if (rows.length) {
+    const { data, error } = await sb.from('weekly_results').upsert(rows, { onConflict: 'week_start', ignoreDuplicates: true }).select();
+    if (error) { console.warn(error); return; }
+    S.results = S.results.concat(data || []).sort((a, b) => a.week_start < b.week_start ? 1 : -1);
+    // prêmio da semana que acabou de fechar: zera para a nova semana
+    if ((data || []).some(r => r.week_start === lastWeek) && S.prize) {
+      const { error: e2 } = await sb.from('app_settings').upsert({ key: 'prize', value: '', updated_at: new Date().toISOString() }, { onConflict: 'key' });
+      if (!e2) S.prize = '';
+    }
+  }
+  S.settledFor = cur;
+}
+
+async function bootExtras() {
+  try {
+    await loadExtras();
+    await settleWeeks();
+    await checkAchievements(true);
+  } catch (e) { console.warn(e); }
+  const ae = document.activeElement;
+  if (S.uid && !(ae && /INPUT|TEXTAREA|SELECT/.test(ae.tagName))) render();
+}
+
+// ----------------------- RESUMO SEMANAL -----------------------
+function weekSummary(uid, ws) {
+  const t = today(), end = addDays(ws, 6), last = end > t ? t : end;
+  const days = [], agg = {};
+  for (let i = 0; i < 7; i++) {
+    const d = addDays(ws, i);
+    if (d > t) { days.push({ d, fut: true, p: 0, has: false }); continue; }
+    const items = dayItems(uid, d);
+    days.push({ d, fut: false, p: dayPct(uid, d), has: items.length > 0 });
+    if (d < t) { // dia de hoje ainda está em andamento: não entra no "mais falho"
+      for (const it of items) {
+        const k = it.id || it.title;
+        const a = (agg[k] ||= { title: it.title, done: 0, total: 0 });
+        a.total++; if (it.done) a.done++;
+      }
+    }
+  }
+  const real = days.filter(x => !x.fut && x.has);
+  const best = real.length ? real.reduce((a, b) => b.p > a.p ? b : a) : null;
+  const missed = Object.values(agg).filter(a => a.done < a.total)
+    .sort((a, b) => (a.done / a.total) - (b.done / b.total) || (b.total - b.done) - (a.total - a.done))[0] || null;
+  const pct = Math.round(rangeAvg(uid, ws, last) * 100);
+  const fd = firstDate(uid);
+  const prev = fd && fd < ws ? Math.round(rangeAvg(uid, addDays(ws, -7), addDays(ws, -1)) * 100) : null;
+  return { days, best, missed, pct, prev, wk: workoutsBetween(uid, ws, last) };
+}
+
+function summaryDue() {
+  const n = new Date(), t = today(), dw = n.getDay();
+  let ws = null;
+  if (dw === 0 && n.getHours() >= 18) ws = weekStart(t);        // domingo à noite: resumo parcial/final
+  else if (dw === 1 || dw === 2) ws = addDays(weekStart(t), -7); // segunda/terça: semana que acabou
+  if (!ws || !S.uid) return null;
+  const fd = firstDate(S.uid);
+  if (!fd || fd > addDays(ws, 6)) return null;
+  let seen = '';
+  try { seen = localStorage.getItem('sum_seen') || ''; } catch (e) {}
+  return seen === ws ? null : ws;
+}
+function summaryCardHTML() {
+  const due = summaryDue();
+  if (!due) return '';
+  return `<button onclick="openSummary('${due}')" class="item w-full card px-4 py-3 text-left flex items-center gap-3 border-emerald-500/30 bg-emerald-500/5">
+    <span class="text-2xl">📊</span>
+    <span class="flex-1 text-sm"><b>Seu resumo semanal está pronto</b><br><span class="text-xs text-neutral-400">${esc(fmtRange(due))} · toque para ver</span></span>
+    <span class="text-neutral-500">›</span>
+  </button>`;
+}
+function openSummary(ws) {
+  if (ws === summaryDue()) { try { localStorage.setItem('sum_seen', ws); } catch (e) {} }
+  S.sw = ws;
+  openModal('summary');
+  if (S.tab === 'today') render();
+}
+function shiftSummary(n) {
+  const nw = addDays(S.sw, 7 * n), cur = weekStart(today());
+  let minW = cur;
+  for (const p of S.profiles) { const f = firstDate(p.id); if (f && weekStart(f) < minW) minW = weekStart(f); }
+  if (nw > cur || nw < minW) return;
+  S.sw = nw;
+  renderModal();
+}
+
+function summaryHTML() {
+  const ws = S.sw, t = today(), cur = weekStart(t);
+  const ps = [me(), partner()].filter(Boolean);
+  const sums = ps.map(p => ({ p, s: weekSummary(p.id, ws) }));
+  const res = S.results.find(r => r.week_start === ws);
+
+  let head;
+  if (res) {
+    const w = ps.find(p => p.id === res.winner_id);
+    head = w ? `👑 <b>${esc(w.name || 'Sem nome')}</b> venceu a semana` : '🤝 Semana empatada';
+    if (res.prize) head += `<div class="text-xs text-neutral-400 mt-1">🎁 ${esc(res.prize)}</div>`;
+  } else if (ws === cur && sums.length === 2) {
+    const sc = {}; sums.forEach(x => sc[x.p.id] = { pct: x.s.pct, wk: x.s.wk });
+    const w = ps.find(p => p.id === pickWinner(sc));
+    head = w ? `Semana em andamento · 👑 <b>${esc(w.name || 'Sem nome')}</b> está na frente` : 'Semana em andamento · empate por enquanto';
+  } else if (ws === cur) {
+    head = 'Semana em andamento';
+  } else {
+    head = 'Semana sem resultado registrado';
+  }
+
+  const delta = s => {
+    if (s.prev === null) return '<span class="text-neutral-500">primeira semana</span>';
+    const d = s.pct - s.prev;
+    const dt = d > 0 ? `<span class="text-emerald-400">▲ +${d} pts</span>` : d < 0 ? `<span class="text-red-400">▼ ${d} pts</span>` : '<span class="text-neutral-400">= igual</span>';
+    return dt + ' <span class="text-neutral-500">vs semana anterior (' + s.prev + '%)</span>';
+  };
+  const bars = s => `<div class="flex gap-1.5 items-end h-16 mt-3">${s.days.map(d => `
+    <div class="flex-1 h-full flex flex-col items-center gap-1">
+      <div class="w-full flex-1 bg-[#1f1f1f] rounded-md flex items-end overflow-hidden"><div style="height:${d.fut ? 0 : Math.round(d.p * 100)}%;background:#10B981" class="w-full"></div></div>
+      <span class="text-[10px] ${d.d === t ? 'text-emerald-400 font-bold' : 'text-neutral-500'}">${DL[dow(d.d)]}</span>
+    </div>`).join('')}</div>`;
+  const insight = s => s.pct >= 90 ? 'Semana excelente. Mantém esse ritmo 🔥' : s.pct >= 70 ? 'Boa semana. Falta pouco para a perfeição 💪' : s.pct >= 50 ? 'Dá para melhorar. Escolha um hábito para focar na próxima.' : 'Semana difícil. O recomeço é na próxima segunda 🌱';
+  const wdName = d => parseD(d).toLocaleDateString('pt-BR', { weekday: 'long' });
+
+  const mine = sums[0], other = sums[1];
+  const m = mine.s;
+  const mainCard = `
+    <div class="card p-4 mb-3">
+      <div class="flex items-center gap-3 mb-1">${av(mine.p, 40)}<div class="flex-1 min-w-0"><div class="font-semibold truncate">${esc(mine.p.name || 'Você')}</div><div class="text-xs">${delta(m)}</div></div>
+        <div class="text-3xl font-bold text-emerald-400">${m.pct}%</div></div>
+      ${bars(m)}
+      <div class="grid grid-cols-3 gap-2 mt-4 text-center">
+        <div class="bg-[#0f0f0f] rounded-xl py-2.5 px-1"><div class="text-lg font-bold">${m.wk}</div><div class="text-[10px] text-neutral-500">💪 treinos</div></div>
+        <div class="bg-[#0f0f0f] rounded-xl py-2.5 px-1"><div class="text-sm font-bold capitalize truncate">${m.best ? esc(wdName(m.best.d).replace('-feira', '')) : '—'}</div><div class="text-[10px] text-neutral-500">⭐ melhor dia${m.best ? ' · ' + Math.round(m.best.p * 100) + '%' : ''}</div></div>
+        <div class="bg-[#0f0f0f] rounded-xl py-2.5 px-1"><div class="text-sm font-bold truncate px-1">${m.missed ? esc(m.missed.title) : 'Nenhum 🎉'}</div><div class="text-[10px] text-neutral-500">⚠️ mais falho${m.missed ? ' · ' + m.missed.done + '/' + m.missed.total : ''}</div></div>
+      </div>
+      <p class="text-xs text-neutral-400 mt-3">${insight(m)}</p>
+    </div>`;
+  const otherCard = other ? `
+    <div class="card p-4">
+      <div class="flex items-center gap-3">${av(other.p, 36)}<div class="flex-1 min-w-0"><div class="font-semibold truncate">${esc(other.p.name || 'Parceiro(a)')}</div><div class="text-xs">${delta(other.s)}</div></div>
+        <div class="text-right"><div class="text-2xl font-bold text-emerald-400">${other.s.pct}%</div><div class="text-[10px] text-neutral-500">💪 ${other.s.wk} treinos</div></div></div>
+    </div>` : '';
+
+  const minW = (() => { let mw = cur; for (const p of S.profiles) { const f = firstDate(p.id); if (f && weekStart(f) < mw) mw = weekStart(f); } return mw; })();
+  const canPrev = ws > minW, canNext = ws < cur;
+  return `
+    <h3 class="text-lg font-bold mb-3">📊 Resumo semanal</h3>
+    <div class="flex items-center justify-between gap-2 mb-3">
+      <button onclick="shiftSummary(-1)" ${canPrev ? '' : 'disabled'} class="btn-ghost w-10 h-10 flex items-center justify-center ${canPrev ? '' : 'opacity-30'}">‹</button>
+      <div class="flex-1 text-center"><div class="font-semibold">${esc(fmtRange(ws))}</div><div class="text-[11px] text-neutral-500">${ws === cur ? 'semana atual' : ws === addDays(cur, -7) ? 'semana passada' : 'segunda a domingo'}</div></div>
+      <button onclick="shiftSummary(1)" ${canNext ? '' : 'disabled'} class="btn-ghost w-10 h-10 flex items-center justify-center ${canNext ? '' : 'opacity-30'}">›</button>
+    </div>
+    <div class="text-sm text-center mb-3">${head}</div>
+    ${mainCard}${otherCard}`;
+}
+
+// ----------------------- CONQUISTAS -----------------------
+const ACH = [
+  { k: 'first_check',   e: '✅', t: 'Primeiro passo',       d: 'Conclua seu primeiro item',               f: s => [s.total, 1] },
+  { k: 'checks_100',    e: '💯', t: 'Cem check-ins',        d: '100 itens concluídos',                    f: s => [s.total, 100] },
+  { k: 'checks_500',    e: '🏗️', t: 'Construtor',           d: '500 itens concluídos',                    f: s => [s.total, 500] },
+  { k: 'streak_7',      e: '🔥', t: 'Semana de fogo',       d: '7 dias seguidos com ≥ 80%',               f: s => [s.best, 7] },
+  { k: 'streak_30',     e: '🌋', t: 'Mês imparável',        d: '30 dias seguidos com ≥ 80%',              f: s => [s.best, 30] },
+  { k: 'streak_100',    e: '👑', t: 'Lenda da constância',  d: '100 dias seguidos com ≥ 80%',             f: s => [s.best, 100] },
+  { k: 'first_workout', e: '💪', t: 'Primeiro treino',      d: 'Conclua seu primeiro treino',             f: s => [s.wk, 1] },
+  { k: 'workouts_10',   e: '🏃', t: 'Pegando ritmo',        d: '10 treinos concluídos',                   f: s => [s.wk, 10] },
+  { k: 'workouts_50',   e: '🏋️', t: 'Máquina',              d: '50 treinos concluídos',                   f: s => [s.wk, 50] },
+  { k: 'perfect_day',   e: '⭐', t: 'Dia perfeito',         d: 'Conclua 100% de um dia',                  f: s => [s.perfectDays, 1] },
+  { k: 'perfect_week',  e: '🌟', t: 'Semana perfeita',      d: 'Uma semana (seg–dom) com 100% todo dia',  f: s => [s.perfectWeeks, 1] },
+  { k: 'perfect_month', e: '🥇', t: 'Mês perfeito',         d: 'Feche um mês com média ≥ 90%',            f: s => [s.goldMonths, 1] },
+  { k: 'week_win',      e: '🏆', t: 'Campeão da semana',    d: 'Vença uma semana do ranking',             f: s => [s.wins, 1] },
+  { k: 'wins_5',        e: '🎖️', t: 'Pentacampeão',         d: 'Vença 5 semanas do ranking',              f: s => [s.wins, 5] },
+  { k: 'goal_done',     e: '🎯', t: 'Meta batida',          d: 'Complete uma meta',                       f: s => [s.goalsDone, 1] }
+];
+
+function achStats(uid) {
+  const t = today(), first = firstDate(uid);
+  const st = {
+    total: 0, best: 0, perfectDays: 0, perfectWeeks: 0, goldMonths: 0,
+    wk: workouts(uid, 0),
+    wins: S.results.filter(r => r.winner_id === uid).length,
+    goalsDone: S.goals.filter(g => g.completed && (g.user_id === uid || g.user_id === null)).length
+  };
+  for (const k of S.done) { const h = habitById(k.split('|')[0]); if (h && h.user_id === uid) st.total++; }
+  for (const k in S.orph) if (k.startsWith(uid + '|')) st.total += S.orph[k].length;
+  if (!first) return st;
+  let d = first;
+  const lim = addDays(t, -1500);
+  if (d < lim) d = lim;
+  let run = 0, wkAll = true, wkDays = 0, mSum = 0, mDays = 0;
+  for (; d <= t; d = addDays(d, 1)) {
+    const p = dayPct(uid, d), items = dayItems(uid, d);
+    if (dow(d) === 1) { wkAll = true; wkDays = 0; }
+    wkDays++;
+    if (p < 1) wkAll = false;
+    if (p >= 0.8) { run++; if (run > st.best) st.best = run; } else run = 0;
+    if (items.length && items.every(i => i.done)) st.perfectDays++;
+    if (dow(d) === 0 && d < t && wkDays === 7 && wkAll) st.perfectWeeks++;
+    mSum += p; mDays++;
+    const nx = addDays(d, 1);
+    if (nx.slice(0, 7) !== d.slice(0, 7)) {
+      if (d < t && mDays >= 20 && mSum / mDays >= 0.9) st.goldMonths++;
+      mSum = 0; mDays = 0;
+    }
+  }
+  return st;
+}
+
+async function checkAchievements(quiet) {
+  if (S.achBusy || !S.uid || !S.extrasOk) return;
+  S.achBusy = true;
+  try {
+    const st = achStats(S.uid);
+    S.astats = st;
+    const have = new Set(S.ach.filter(a => a.user_id === S.uid).map(a => a.key));
+    const fresh = ACH.filter(a => { if (have.has(a.k)) return false; const [c, tg] = a.f(st); return c >= tg; });
+    if (!fresh.length) return;
+    const { data, error } = await sb.from('achievements')
+      .upsert(fresh.map(a => ({ user_id: S.uid, key: a.k })), { onConflict: 'user_id,key', ignoreDuplicates: true })
+      .select();
+    if (error) throw error;
+    const got = data || [];
+    S.ach = S.ach.concat(got);
+    if (got.length) {
+      if (quiet && got.length > 1) toast('🏅 ' + got.length + ' conquistas desbloqueadas!');
+      else if (got.length === 1) { const a = ACH.find(x => x.k === got[0].key); toast('🏅 Conquista: ' + a.e + ' ' + a.t); if (!quiet) confetti(); }
+      else { toast('🏅 ' + got.length + ' novas conquistas!'); if (!quiet) confetti(); }
+    }
+  } catch (e) {
+    console.warn('Conquistas:', e);
+  } finally {
+    S.achBusy = false;
+    if (S.tab === 'profile') render();
+  }
+}
+
+function achSection(p, isMe) {
+  if (!S.extrasOk) return `<div class="card p-4 mb-4"><h3 class="font-semibold text-sm mb-1">🏅 Conquistas</h3><p class="text-sm text-neutral-500">Indisponível: rode a migração SQL <code>migracao-semana-conquistas.sql</code> no Supabase.</p></div>`;
+  const got = new Map(S.ach.filter(a => a.user_id === p.id).map(a => [a.key, a.unlocked_at]));
+  if (isMe && !S.astats) S.astats = achStats(S.uid);
+  const st = isMe ? S.astats : null;
+  const items = ACH.map(a => ({ a, on: got.has(a.k), at: got.get(a.k) || '', pr: st ? a.f(st) : null }));
+  const ratio = x => x.pr ? Math.min(1, x.pr[0] / x.pr[1]) : 0;
+  items.sort((x, y) => (y.on - x.on) || (x.on ? (x.at < y.at ? 1 : -1) : ratio(y) - ratio(x)));
+  const n = items.filter(x => x.on).length;
+  const card = x => `
+    <div class="card p-3 ${x.on ? 'border-emerald-500/40 bg-emerald-500/5' : 'opacity-60'}">
+      <div class="flex items-center gap-2">
+        <span class="text-2xl ${x.on ? '' : 'gray'}">${x.a.e}</span>
+        <div class="min-w-0"><div class="text-sm font-semibold truncate">${esc(x.a.t)}</div><div class="text-[11px] text-neutral-500 leading-tight">${esc(x.a.d)}</div></div>
+      </div>
+      ${x.on ? `<div class="text-[10px] text-emerald-400 mt-2">Desbloqueada em ${esc(fmtShort(ymd(new Date(x.at))))}</div>`
+        : x.pr ? `<div class="pb mt-2"><div style="width:${Math.round(ratio(x) * 100)}%"></div></div><div class="text-[10px] text-neutral-500 mt-1">${Math.min(Math.floor(x.pr[0]), x.pr[1])}/${x.pr[1]}</div>` : ''}
+    </div>`;
+  return `
+    <div class="mb-4">
+      <div class="flex items-center justify-between mb-2"><h3 class="font-semibold text-sm">🏅 Conquistas</h3><span class="text-xs text-neutral-500">${n}/${ACH.length}</span></div>
+      <div class="grid grid-cols-2 gap-2">${items.map(card).join('')}</div>
+    </div>`;
+}
+
 function av(p, size) {
   const s = size || 48;
   if (p && p.avatar_url) return `<img src="${esc(p.avatar_url)}" alt="" style="width:${s}px;height:${s}px" class="rounded-full object-cover border border-[#262626] flex-none">`;
@@ -239,6 +590,7 @@ sb.auth.onAuthStateChange((ev, session) => {
 
 function stopApp() {
   S.uid = null; S.started = false;
+  S.results = []; S.ach = []; S.astats = null; S.extrasOk = false; S.settledFor = null;
   clearInterval(S.poll);
   $('app').classList.add('hidden');
   $('login').classList.remove('hidden');
@@ -260,6 +612,7 @@ async function start(user) {
     await loadPrize();
     await loadNote();
     render();
+    bootExtras();
     clearInterval(S.poll);
     S.poll = setInterval(loadNudges, 30000);
   } catch (e) {
@@ -268,7 +621,11 @@ async function start(user) {
   }
 }
 
-document.addEventListener('visibilitychange', () => { if (!document.hidden && S.uid) loadNudges(); });
+document.addEventListener('visibilitychange', () => {
+  if (document.hidden || !S.uid) return;
+  loadNudges();
+  if (S.settledFor !== weekStart(today())) bootExtras(); // virou a semana com o app aberto
+});
 
 async function loadAll() {
   const [pr, hb, lg, gl, nd] = await Promise.all([
@@ -327,8 +684,8 @@ const TABS = [['today', 'Hoje', '✅'], ['tasks', 'Tarefas', '📋'], ['rank', '
 
 function setTab(t) {
   S.tab = t;
-  if (t === 'rank') loadPrize().then(() => { if (S.tab === 'rank') render(); });
-  if (t === 'profile') { S.px = null; loadPx(); }
+  if (t === 'rank') Promise.all([loadPrize(), loadExtras()]).then(() => { if (S.tab === 'rank') render(); });
+  if (t === 'profile') { S.px = null; loadPx(); loadExtras().then(() => { if (S.tab === 'profile') render(); }); }
   if (t === 'tasks') { S.tdate = S.date; S.tasks = null; loadTasks(); }
   render();
   window.scrollTo(0, 0);
@@ -411,6 +768,8 @@ function vToday() {
       <button onclick="shiftDate(1)" ${isT ? 'disabled' : ''} class="btn-ghost w-11 h-11 flex items-center justify-center text-lg ${isT ? 'opacity-30' : ''}">›</button>
     </div>
 
+    ${summaryCardHTML()}
+
     <div class="card p-4">
       <div class="flex items-end justify-between mb-2">
         <span class="text-sm text-neutral-400">Progresso do dia</span>
@@ -475,6 +834,7 @@ async function toggleHabit(id) {
     confetti();
     toast('Dia 100% concluído! 🎉🔥');
   }
+  if (!was) checkAchievements();
 }
 
 function confetti() {
@@ -600,7 +960,7 @@ async function deleteTask(id) {
 }
 
 
-// ----------------------- GERENCIAR HÁBITOS (modal) -----------------------
+// ----------------------- MODAIS (gerenciar hábitos, meta, resumo) -----------------------
 function openModal(m) { S.modal = m; renderModal(); }
 function closeModal() { S.modal = null; S.eg = null; renderModal(); }
 function openGoal(id) { S.eg = id || null; openModal('goal'); }
@@ -608,12 +968,11 @@ function openGoal(id) { S.eg = id || null; openModal('goal'); }
 function renderModal() {
   const m = $('modal');
   if (!S.modal) { m.innerHTML = ''; document.body.style.overflow = ''; return; }
-  const prevBody = $('modalBody');                 // novo
-  const keepScroll = prevBody ? prevBody.scrollTop : 0;   // novo
-  const wasOpen = !!prevBody;                      // novo
+  const prevBody = $('modalBody');
+  const keepScroll = prevBody ? prevBody.scrollTop : 0;
+  const wasOpen = !!prevBody;
   document.body.style.overflow = 'hidden';
   let inner = '';
-  // ... (resto igual)
   if (S.modal === 'manage') {
     const mine = S.habits.filter(h => h.user_id === S.uid);
     inner = `
@@ -658,6 +1017,8 @@ function renderModal() {
         </select>
         <button onclick="saveGoal()" class="btn w-full">${g ? 'Salvar alterações' : 'Criar meta'}</button>
       </div>`;
+  } else if (S.modal === 'summary') {
+    inner = summaryHTML();
   }
   m.innerHTML = `
     <div class="fixed inset-0 z-50 bg-black/70 flex items-end md:items-center justify-center ${wasOpen ? '' : 'fade'}" onclick="if(event.target===this)closeModal()">
@@ -666,7 +1027,7 @@ function renderModal() {
         ${inner}
       </div>
     </div>`;
-  if (wasOpen) { const b = $('modalBody'); if (b) b.scrollTop = keepScroll; }   // novo
+  if (wasOpen) { const b = $('modalBody'); if (b) b.scrollTop = keepScroll; }
 }
 
 async function addHabit() {
@@ -733,9 +1094,11 @@ async function savePrize() {
 
 // ----------------------- ABA RANKING -----------------------
 function vRank() {
+  const t = today(), ws = weekStart(t);
   const ps = [me(), partner()].filter(Boolean);
-  const stats = ps.map(p => ({ p, w: rangePct(p.id, 7), m: rangePct(p.id, 30), s: streak(p.id), t: workouts(p.id, 30) }));
-  // Líder = maior % semanal (comparado pelo valor exibido); desempate: mensal, streak, treinos
+  // "Semana" = segunda até hoje (semana de calendário); mensal/streak continuam em janela móvel
+  const stats = ps.map(p => ({ p, w: rangeAvg(p.id, ws, t), m: rangePct(p.id, 30), s: streak(p.id), t: workouts(p.id, 30) }));
+  // Líder = maior % da semana (valor exibido); desempate: mensal, streak, treinos
   const key = st => [Math.round(st.w * 100), Math.round(st.m * 100), st.s, st.t];
   const cmp = (a, b) => { const ka = key(a), kb = key(b); for (let i = 0; i < ka.length; i++) if (ka[i] !== kb[i]) return ka[i] - kb[i]; return 0; };
   let leader = null;
@@ -743,10 +1106,11 @@ function vRank() {
     const c = cmp(stats[0], stats[1]);
     if (c !== 0) leader = (c > 0 ? stats[0] : stats[1]).p.id;
   }
-    const lead = stats.find(s => s.p.id === leader);
+  const lead = stats.find(s => s.p.id === leader);
+
   const prizeBox = stats.length < 2 ? '' : `
     <div class="card p-4 mb-4 ${lead ? 'border-emerald-500/50 bg-emerald-500/5' : ''}">
-      <div class="text-xs uppercase tracking-wider text-neutral-500 font-semibold mb-2 text-center">🏆 Prêmio da semana</div>
+      <div class="text-xs uppercase tracking-wider text-neutral-500 font-semibold mb-2 text-center">🏆 Prêmio da semana · ${esc(fmtRange(ws))}</div>
       <div class="flex gap-2">
         <input id="prizeIn" class="inp flex-1" maxlength="120" placeholder="Qual é o prêmio?" value="${esc(S.prize)}">
         <button onclick="savePrize()" class="btn">Salvar</button>
@@ -754,7 +1118,9 @@ function vRank() {
       <div class="text-sm mt-3 text-center">${lead
         ? `👑 <b>${esc(lead.p.name || 'Sem nome')}</b> está ganhando com <b>${pctTxt(lead.w)}</b> na semana`
         : 'Empate por enquanto. Ninguém está ganhando ainda.'}</div>
+      <div class="text-[11px] text-neutral-600 mt-2 text-center">A semana fecha no domingo: o vencedor é registrado no placar e o prêmio é zerado.</div>
     </div>`;
+
   const bar = v => `<div class="pb mt-1"><div style="width:${Math.round(v * 100)}%"></div></div>`;
   const card = st => `
     <div class="card p-4 text-center ${st.p.id === leader ? 'border-emerald-500/50' : ''}">
@@ -762,17 +1128,58 @@ function vRank() {
       <div class="font-bold truncate">${esc(st.p.name || 'Sem nome')} ${st.p.id === leader ? '👑' : ''}</div>
       <div class="text-xs text-neutral-500 mb-3">${st.p.id === S.uid ? 'Você' : 'Parceiro(a)'}</div>
       <div class="text-left space-y-3">
-        <div><div class="flex justify-between text-xs text-neutral-400"><span>Semanal</span><b class="text-emerald-400 text-base">${pctTxt(st.w)}</b></div>${bar(st.w)}</div>
+        <div><div class="flex justify-between text-xs text-neutral-400"><span>Esta semana</span><b class="text-emerald-400 text-base">${pctTxt(st.w)}</b></div>${bar(st.w)}</div>
         <div><div class="flex justify-between text-xs text-neutral-400"><span>Mensal</span><b class="text-emerald-400 text-base">${pctTxt(st.m)}</b></div>${bar(st.m)}</div>
         <div class="flex justify-between text-sm pt-1"><span class="text-neutral-400">🔥 Streak</span><b>${st.s} ${st.s === 1 ? 'dia' : 'dias'}</b></div>
         <div class="flex justify-between text-sm"><span class="text-neutral-400">💪 Treinos (30d)</span><b>${st.t}</b></div>
       </div>
     </div>`;
+
+  // placar de semanas + histórico
+  let board = '';
+  if (stats.length === 2) {
+    if (!S.extrasOk) {
+      board = `<div class="card p-4 mt-4"><h3 class="font-semibold text-sm mb-1">🏆 Placar de semanas</h3><p class="text-sm text-neutral-500">Indisponível: rode a migração SQL <code>migracao-semana-conquistas.sql</code> no Supabase.</p></div>`;
+    } else {
+      const wins = {}; ps.forEach(p => wins[p.id] = 0);
+      let ties = 0;
+      S.results.forEach(r => { if (r.winner_id && r.winner_id in wins) wins[r.winner_id]++; else ties++; });
+      const hist = S.results.slice(0, 8).map(r => {
+        const w = ps.find(p => p.id === r.winner_id);
+        const sc = ps.map(p => (r.scores && r.scores[p.id] ? r.scores[p.id].pct : 0) + '%').join(' × ');
+        return `<button onclick="openSummary('${r.week_start}')" class="w-full flex items-center gap-2 text-sm py-2 border-t border-[#1f1f1f] text-left">
+          <span class="text-neutral-500 text-xs w-24 flex-none">${esc(fmtRange(r.week_start))}</span>
+          <span class="flex-1 truncate">${w ? '👑 ' + esc(w.name || 'Sem nome') : '🤝 Empate'}${r.prize ? ' <span class="text-neutral-500 text-xs">· 🎁 ' + esc(r.prize) + '</span>' : ''}</span>
+          <span class="text-xs text-neutral-400 flex-none">${sc}</span>
+        </button>`;
+      }).join('');
+      board = `
+        <div class="card p-4 mt-4">
+          <h3 class="font-semibold text-sm mb-3 text-center">🏆 Placar de semanas</h3>
+          <div class="flex items-center justify-center gap-4">
+            <div class="flex-1 text-center min-w-0"><div class="text-xs text-neutral-400 truncate">${esc(ps[0].name || 'Você')}</div><div class="text-3xl font-bold text-emerald-400">${wins[ps[0].id]}</div></div>
+            <div class="text-neutral-600 text-xl">×</div>
+            <div class="flex-1 text-center min-w-0"><div class="text-xs text-neutral-400 truncate">${esc(ps[1].name || 'Parceiro(a)')}</div><div class="text-3xl font-bold text-emerald-400">${wins[ps[1].id]}</div></div>
+          </div>
+          ${ties ? `<div class="text-xs text-neutral-500 text-center mt-1">${ties} ${ties === 1 ? 'empate' : 'empates'}</div>` : ''}
+          <div class="mt-3">${hist || '<p class="text-sm text-neutral-500 text-center">Nenhuma semana fechada ainda. A primeira fecha no próximo domingo.</p>'}</div>
+          ${hist ? '<div class="text-[11px] text-neutral-600 mt-1 text-center">Toque em uma semana para ver o resumo. Placar na ordem dos nomes acima.</div>' : ''}
+        </div>`;
+    }
+  }
+  const sumBtns = `
+    <div class="grid grid-cols-2 gap-2 mt-4">
+      <button onclick="openSummary('${addDays(ws, -7)}')" class="btn-ghost">📊 Semana passada</button>
+      <button onclick="openSummary('${ws}')" class="btn-ghost">📊 Esta semana</button>
+    </div>`;
+
   return `
     <h1 class="text-xl font-bold mb-1">Ranking</h1>
-    <p class="text-xs text-neutral-500 mb-4">Percentual de hábitos/treinos concluídos. 👑 = maior % semanal (desempate: mensal, streak, treinos). Streak: dias seguidos com ≥ 80%.</p>
+    <p class="text-xs text-neutral-500 mb-4">Percentual de hábitos/treinos concluídos. 👑 = maior % da semana (segunda a domingo; desempate: mensal, streak, treinos). Streak: dias seguidos com ≥ 80%.</p>
     ${prizeBox}
     <div class="grid grid-cols-2 gap-3">${stats.map(card).join('')}</div>
+    ${stats.length === 2 ? sumBtns : ''}
+    ${board}
     ${stats.length < 2 ? '<p class="text-sm text-neutral-500 text-center mt-6">Aguardando o segundo perfil ser criado no Supabase.</p>' : ''}`;
 }
 
@@ -829,6 +1236,7 @@ async function updateGoal(g, val) {
   render();
   const { error } = await sb.from('goals').update({ current_value: g.current_value, completed: g.completed }).eq('id', g.id);
   if (error) { Object.assign(g, old); render(); toast('Erro ao atualizar meta.', true); }
+  else if (g.completed) checkAchievements();
 }
 function adjustGoal(id, d) {
   const g = S.goals.find(x => x.id === id);
@@ -865,6 +1273,7 @@ async function saveGoal() {
     toast('Meta criada ✓');
   }
   closeModal(); render();
+  if (row.completed) checkAchievements();
 }
 async function deleteGoal(id) {
   if (!confirm('Excluir esta meta?')) return;
@@ -956,7 +1365,7 @@ function vProfile() {
     </div>
     <button onclick="logout()" class="btn-ghost w-full !text-red-400">Sair</button>` : '';
 
-  return toggle + head + info + heat + note + weight + edit;
+  return toggle + head + info + achSection(p, isMe) + heat + note + weight + edit;
 }
 
 function weightChart(ws) {
